@@ -1,0 +1,1559 @@
+package main
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"log/slog"
+	"maps"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	convex "github.com/inselfcontroll/convex-go"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+
+	"go.jetify.com/sse"
+	"go.jetify.com/typeid/v2"
+)
+
+const (
+	Host = "0.0.0.0"
+	Port = "8976"
+
+	// HTTP methods
+	MethodGet     = "GET"
+	MethodPost    = "POST"
+	MethodPut     = "PUT"
+	MethodDelete  = "DELETE"
+	MethodPatch   = "PATCH"
+	MethodOptions = "OPTIONS"
+
+	// Content types
+	ContentTypeJSON        = "application/json"
+	ContentTypeEventStream = "text/event-stream"
+
+	// HTTP State codes
+	StatusOK                  = 200
+	StatusCreated             = 201
+	StatusNoContent           = 204
+	StatusBadRequest          = 400
+	StatusUnauthorized        = 401
+	StatusNotFound            = 404
+	StatusInternalServerError = 500
+	StatusMethodNotAllowed    = 405
+	StatusMultipleChoices     = 300
+
+	HeaderContentType  = "Content-Type"
+	HeaderCacheControl = "Cache-Control"
+	HeaderConnection   = "Connection"
+	HeaderAllowOrigin  = "Access-Control-Allow-Origin"
+	HeaderAllowMethods = "Access-Control-Allow-Methods"
+	HeaderAllowHeaders = "Access-Control-Allow-Headers"
+
+	defaultTimeout = 12 * time.Second
+	days90         = 90
+)
+
+var (
+	timestamp         = time.Now().Format("15:04:05.000")
+	workerEndpointURL = os.Getenv("WORKER_ENDPOINT_URL")
+	secretKey         = os.Getenv("SECRET_KEY")
+	xapiKey           = os.Getenv("X_API_KEY")
+)
+
+// ----------- DB / CACHE CONNECTIONS -----------
+
+var (
+	jwt              = os.Getenv("NATS_JWT")
+	seed             = os.Getenv("NATS_SEED")
+	serverURL        = os.Getenv("NATS_URL")
+	userAgent        = os.Getenv("USER_AGENT")
+	convexClient     = convex.NewClient(os.Getenv("CONVEX_CLOUD_URL"), nil)
+	monitorStartTime = time.Now().UTC().Truncate(24 * time.Hour)
+	probeManagerOnce sync.Once
+	hr               = HealthResponse{Down: "down", Up: "up", Warn: "warn", Default: "default"}
+	nc               *nats.Conn
+	wg               sync.WaitGroup
+	js               jetstream.JetStream
+	kv               jetstream.KeyValue
+	alertKV          jetstream.KeyValue
+	httpClient       = &http.Client{
+		Timeout: defaultTimeout,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   defaultTimeout,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   defaultTimeout,
+			ResponseHeaderTimeout: defaultTimeout,
+			IdleConnTimeout:       90 * time.Second,
+			MaxIdleConns:          200,
+			MaxIdleConnsPerHost:   20,
+		},
+	}
+)
+
+// -------------------- GLOBAL SLA MAP --------------------
+var targetCache = struct {
+	sync.RWMutex
+	targets []HttpRequest
+	lookup  map[string]int
+}{
+	lookup: make(map[string]int),
+}
+
+var slaTrackers = struct {
+	sync.Mutex
+	m map[string]*SlidingSLA
+}{m: make(map[string]*SlidingSLA)}
+
+func fetchTargets(ctx context.Context) []HttpRequest {
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	type Status struct {
+		ID       string `json:"_id"`
+		Name     string `json:"name"`
+		Protocol string `json:"protocol"`
+		Host     string `json:"host"`
+		Interval int64  `json:"interval"`
+	}
+
+	args := map[string]any{
+		"apiKey": os.Getenv("API_KEY"),
+	}
+
+	statuses, err := convex.Query[[]Status](ctx, convexClient, "status:get", args)
+
+	if err != nil {
+		if convexErr, ok := convex.IsConvexError(err); ok {
+			slog.Error("Convex error", "message", convexErr.Message)
+		} else {
+			slog.Error("Request failed", "error", err)
+		}
+	}
+
+	raw := []HttpRequest{}
+	for _, u := range statuses {
+		raw = append(raw, HttpRequest{
+			ID:       u.ID,
+			Name:     u.Name,
+			Protocol: u.Protocol,
+			Host:     u.Host,
+			Interval: time.Duration(u.Interval) * time.Second,
+		})
+	}
+
+	out := make([]HttpRequest, 0, len(raw))
+	counts := make(map[string]int)
+
+	for _, r := range raw {
+		name := r.Name
+		counts[name]++
+		if counts[name] > 1 {
+			r.Name = fmt.Sprintf("%s-%d", name, counts[name])
+
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func refreshCache(ctx context.Context) {
+	targets := fetchTargets(ctx)
+
+	targetCache.Lock()
+	targetCache.targets = targets
+	targetCache.lookup = make(map[string]int)
+	for i, t := range targets {
+		targetCache.lookup[t.Name] = i
+	}
+	targetCache.Unlock()
+	slog.Debug("Target cache refreshed", "count", len(targets))
+}
+
+// -------------------- MODELS --------------------
+type HttpRequest struct {
+	ID       string        `json:"id,omitempty"`
+	Host     string        `json:"host,omitempty"`
+	Protocol string        `json:"protocol,omitempty"`
+	Interval time.Duration `json:"interval,omitempty"`
+	Name     string        `json:"name,omitempty"`
+	Username string        `json:"username,omitempty"`
+	Password string        `json:"password,omitempty"`
+}
+
+type HealthResponse struct {
+	Down    string `json:"down"`
+	Up      string `json:"up"`
+	Warn    string `json:"warn"`
+	Default string `json:"default"`
+}
+
+type ProbeResult struct {
+	Id          string   `json:"id,omitempty"`
+	Name        string   `json:"name,omitempty"`
+	Protocol    string   `json:"protocol,omitempty"`
+	State       []string `json:"state,omitempty"`
+	Action      []string `json:"action,omitempty"`
+	Description string   `json:"description,omitempty"`
+	Date        []string `json:"date,omitempty"`
+	Timestamp   string   `json:"timestamp,omitempty"`
+}
+
+type ProbeResponse struct {
+	Index   int           `json:"index"`
+	Payload StatusPayload `json:"payload"`
+}
+
+type StatusPayload struct {
+	Probe ProbeResult    `json:"probe"`
+	SLA   map[string]any `json:"sla"`
+}
+
+type ErrorResponse struct {
+	State   []string `json:"state"`
+	Message string   `json:"message"`
+}
+
+type bucket struct{ totalSec, downSec int64 }
+
+type SlidingSLA struct {
+	Target        float64
+	buckets       []bucket
+	idx           int
+	currentMinute time.Time
+	lastUpdate    time.Time
+	mu            sync.Mutex
+}
+
+// -------------------- RECOVERY --------------------
+func recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("Recovered from panic: %v\n", rec)
+				if w.Header().Get(HeaderContentType) == "" {
+					w.Header().Set(HeaderContentType, ContentTypeJSON)
+				}
+				w.WriteHeader(StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(ErrorResponse{
+					State:   []string{"error"},
+					Message: "internal server error",
+				})
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func parseDurationToSecs(s string) int64 {
+	var total int64
+	parts := strings.FieldsSeq(s)
+	for part := range parts {
+		var val int64
+		if strings.HasSuffix(part, "d") {
+			fmt.Sscanf(part, "%dd", &val)
+			total += val * 86400
+		} else if strings.HasSuffix(part, "h") {
+			fmt.Sscanf(part, "%dh", &val)
+			total += val * 3600
+		} else if strings.HasSuffix(part, "m") {
+			fmt.Sscanf(part, "%dm", &val)
+			total += val * 60
+		} else if strings.HasSuffix(part, "s") {
+			fmt.Sscanf(part, "%ds", &val)
+			total += val
+		}
+	}
+	return total
+}
+
+func formatDurationFull(seconds int64) string {
+	days := seconds / 86400
+	seconds %= 86400
+	hours := seconds / 3600
+	seconds %= 3600
+	minutes := seconds / 60
+	seconds %= 60
+
+	parts := []string{}
+	if days > 0 {
+		parts = append(parts, fmt.Sprintf("%dd", days))
+	}
+	if hours > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", hours))
+	}
+	if minutes > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", minutes))
+	}
+	if seconds > 0 || len(parts) == 0 {
+		parts = append(parts, fmt.Sprintf("%ds", seconds))
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func getRecentDates() []string {
+	return []string{time.Now().UTC().Format("02/01/2006")}
+}
+
+// -------------------- BROADCAST HUB --------------------
+type Hub struct {
+	clients atomic.Value
+	cache   map[string]StatusPayload
+	mu      sync.RWMutex
+}
+
+func NewHub() *Hub {
+	h := &Hub{
+		cache: make(map[string]StatusPayload),
+	}
+	h.clients.Store([]chan map[string]StatusPayload{})
+	return h
+}
+
+var globalHub = NewHub()
+
+func (h *Hub) AddClient(ch chan map[string]StatusPayload) {
+	old := h.clients.Load().([]chan map[string]StatusPayload)
+
+	newClients := make([]chan map[string]StatusPayload, len(old)+1)
+	copy(newClients, old)
+	newClients[len(old)] = ch
+
+	h.clients.Store(newClients)
+}
+
+func (h *Hub) RemoveClient(ch chan map[string]StatusPayload) {
+	old := h.clients.Load().([]chan map[string]StatusPayload)
+
+	newClients := make([]chan map[string]StatusPayload, 0, len(old)-1)
+
+	for _, c := range old {
+		if c != ch {
+			newClients = append(newClients, c)
+		}
+	}
+
+	h.clients.Store(newClients)
+}
+
+func (h *Hub) Broadcast(update map[string]StatusPayload) {
+
+	h.mu.Lock()
+	for id, payload := range update {
+
+		if len(payload.Probe.Action) > 0 && payload.Probe.Action[0] == "deleted" {
+			delete(h.cache, id)
+		} else {
+			h.cache[id] = payload
+		}
+	}
+
+	h.mu.Unlock()
+	clients := h.clients.Load().([]chan map[string]StatusPayload)
+
+	for _, ch := range clients {
+		select {
+		case ch <- update:
+		default:
+		}
+	}
+}
+
+func slaId() string {
+	slaId := typeid.MustGenerate("sla")
+	return slaId.String()
+}
+
+func sendToEndpoint(endpointURL string, name string, state string) {
+	payload := map[string]string{
+		"name":  name,
+		"state": state,
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		slog.Error("Failed to marshal down alert payload", "error", err)
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewBuffer(jsonData))
+		if err != nil {
+			slog.Error("Failed to create worker endpoint request", "error", err)
+			return
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", secretKey)
+		req.Header.Set("X-API-KEY", xapiKey)
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			slog.Error("Failed to send down status to endpoint", "error", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
+			slog.Warn("Worker endpoint returned non-success status", "status", resp.StatusCode)
+		}
+	}()
+}
+
+func handleEndpointAlertState(alertKV jetstream.KeyValue, workerEndpointURL string, probeName string, currentState string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	entry, err := alertKV.Get(ctx, probeName)
+	lastAlertState := "UP"
+
+	if err == nil && entry != nil {
+		lastAlertState = string(entry.Value())
+	}
+
+	if lastAlertState == currentState {
+		return
+	}
+
+	_, err = alertKV.PutString(ctx, probeName, currentState)
+	if err != nil {
+		slog.Error("Failed to update alert state lock in NATS", "error", err)
+		return
+	}
+
+	if currentState == hr.Down {
+		sendToEndpoint(workerEndpointURL, probeName, hr.Down)
+	}
+}
+
+// -------------------- PROBES --------------------
+func probeHTTP(re HttpRequest) ProbeResult {
+	url := fmt.Sprintf("%s://%s", re.Protocol, re.Host)
+	maxRetries := 5
+
+	if userAgent == "" {
+		userAgent = "Ohstatus/1.0"
+	}
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			cancel()
+			slog.Error("Failed to create HTTP request", "error", err)
+			continue
+		}
+		req.Header.Set("User-Agent", userAgent)
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			cancel()
+			if attempt < maxRetries {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+
+			// Transport/Network failed completely -> DOWN
+			handleEndpointAlertState(alertKV, workerEndpointURL, re.Name, hr.Down)
+			return ProbeResult{
+				Id:          re.ID,
+				Name:        re.Name,
+				Protocol:    strings.ToUpper(re.Protocol),
+				Description: fmt.Sprintf("%s - %s", re.Host, err.Error()),
+				Timestamp:   time.Now().Format("15:04:05.000"),
+				Date:        getRecentDates(),
+				State:       []string{hr.Down},
+			}
+		}
+
+		resp.Body.Close()
+		cancel()
+
+		if resp.StatusCode >= StatusOK && resp.StatusCode < StatusBadRequest {
+			return ProbeResult{
+				Id:          re.ID,
+				Name:        re.Name,
+				Protocol:    strings.ToUpper(re.Protocol),
+				Description: fmt.Sprintf("%s - %d", re.Host, resp.StatusCode),
+				Timestamp:   time.Now().Format("15:04:05.000"),
+				Date:        getRecentDates(),
+				State:       []string{hr.Up},
+			}
+		}
+
+		if attempt < maxRetries {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		// 4xx status is degraded/misconfigured -> WARN
+		finalState := hr.Down
+		if resp.StatusCode >= StatusBadRequest && resp.StatusCode < StatusInternalServerError {
+			finalState = hr.Warn
+		}
+
+		handleEndpointAlertState(alertKV, workerEndpointURL, re.Name, finalState)
+		return ProbeResult{
+			Id:          re.ID,
+			Name:        re.Name,
+			Protocol:    strings.ToUpper(re.Protocol),
+			Description: fmt.Sprintf("%s - %d", re.Host, resp.StatusCode),
+			Timestamp:   time.Now().Format("15:04:05.000"),
+			Date:        getRecentDates(),
+			State:       []string{finalState},
+		}
+	}
+
+	return ProbeResult{}
+}
+
+func probeTCP(re HttpRequest) ProbeResult {
+	maxRetries := 5
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		host := re.Host
+		if !strings.Contains(host, ":") {
+			host = net.JoinHostPort(host, "80")
+		}
+
+		conn, err := net.DialTimeout("tcp", host, defaultTimeout)
+		if err != nil {
+			if attempt < maxRetries {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+
+			// Port unreachable -> DOWN
+			handleEndpointAlertState(alertKV, workerEndpointURL, re.Name, hr.Down)
+			return ProbeResult{
+				Id:          re.ID,
+				Name:        re.Name,
+				Protocol:    strings.ToUpper(re.Protocol),
+				Description: err.Error(),
+				Timestamp:   time.Now().Format("15:04:05.000"),
+				Date:        getRecentDates(),
+				State:       []string{hr.Down},
+			}
+		}
+
+		_, err = conn.Write([]byte("ping\n"))
+		if err != nil {
+			conn.Close()
+			if attempt < maxRetries {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+
+			handleEndpointAlertState(alertKV, workerEndpointURL, re.Name, hr.Down)
+			return ProbeResult{
+				Id:          re.ID,
+				Name:        re.Name,
+				Protocol:    strings.ToUpper(re.Protocol),
+				Description: "write failed: " + err.Error(),
+				Timestamp:   time.Now().Format("15:04:05.000"),
+				Date:        getRecentDates(),
+				State:       []string{hr.Down},
+			}
+		}
+
+		buf := make([]byte, 64)
+		_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, err := conn.Read(buf)
+		conn.Close()
+
+		if err != nil || n == 0 {
+			if attempt < maxRetries {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+
+			// Port open, but no application response -> UP
+			return ProbeResult{
+				Id:          re.ID,
+				Name:        re.Name,
+				Protocol:    strings.ToUpper(re.Protocol),
+				Description: "no response after connect",
+				Timestamp:   time.Now().Format("15:04:05.000"),
+				Date:        getRecentDates(),
+				State:       []string{hr.Up},
+			}
+		}
+
+		return ProbeResult{
+			Id:          re.ID,
+			Name:        re.Name,
+			Protocol:    strings.ToUpper(re.Protocol),
+			Description: fmt.Sprintf("response received %s", strings.TrimSpace(string(buf[:n]))),
+			Timestamp:   time.Now().Format("15:04:05.000"),
+			Date:        getRecentDates(),
+			State:       []string{hr.Up},
+		}
+	}
+
+	return ProbeResult{}
+}
+
+func probeDNS(re HttpRequest) ProbeResult {
+	maxRetries := 5
+
+	if net.ParseIP(re.Host) != nil {
+		return ProbeResult{
+			Id:          re.ID,
+			Name:        re.Name,
+			Protocol:    strings.ToUpper(re.Protocol),
+			Description: "Input is already an IP, DNS lookup skipped",
+			Timestamp:   time.Now().Format("15:04:05.000"),
+			Date:        getRecentDates(),
+			State:       []string{hr.Default},
+		}
+	}
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+		addrs, err := net.DefaultResolver.LookupHost(ctx, re.Host)
+		cancel()
+
+		if err != nil {
+			if attempt < maxRetries {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+
+			// DNS lookup failed -> DOWN
+			handleEndpointAlertState(alertKV, workerEndpointURL, re.Name, hr.Down)
+			return ProbeResult{
+				Id:          re.ID,
+				Name:        re.Name,
+				Protocol:    strings.ToUpper(re.Protocol),
+				Description: fmt.Sprintf("DNS error: %s", err.Error()),
+				Timestamp:   time.Now().Format("15:04:05.000"),
+				Date:        getRecentDates(),
+				State:       []string{hr.Down},
+			}
+		}
+
+		return ProbeResult{
+			Id:          re.ID,
+			Name:        re.Name,
+			Protocol:    strings.ToUpper(re.Protocol),
+			Description: fmt.Sprintf("resolved %v", addrs),
+			Timestamp:   time.Now().Format("15:04:05.000"),
+			Date:        getRecentDates(),
+			State:       []string{hr.Up},
+		}
+	}
+
+	return ProbeResult{}
+}
+
+// -------------------- 90-DAY SLA --------------------
+
+func NewSlidingSLA(target float64) *SlidingSLA {
+	now := time.Now()
+	return &SlidingSLA{
+		Target:        target,
+		buckets:       make([]bucket, days90),
+		currentMinute: now.Truncate(24 * time.Hour),
+		lastUpdate:    now,
+	}
+}
+
+func (s *SlidingSLA) SetState(totalSec, downSec int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buckets[s.idx].totalSec = totalSec
+	s.buckets[s.idx].downSec = downSec
+}
+
+func (s *SlidingSLA) rotateTo(now time.Time) {
+	minNow := now.Truncate(24 * time.Hour)
+	if !minNow.After(s.currentMinute) {
+		return
+	}
+	steps := int(minNow.Sub(s.currentMinute) / (24 * time.Hour))
+	if steps > days90 {
+		for i := range s.buckets {
+			s.buckets[i] = bucket{}
+		}
+		s.idx = 0
+		s.currentMinute = minNow
+		return
+	}
+	for range steps {
+		s.idx++
+		if s.idx >= len(s.buckets) {
+			s.idx = 0
+		}
+		s.buckets[s.idx] = bucket{}
+	}
+	s.currentMinute = minNow
+}
+
+func (s *SlidingSLA) DailySnapshot() (int64, int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buckets[s.idx].totalSec, s.buckets[s.idx].downSec
+}
+
+func (s *SlidingSLA) Tick(isDown bool, interval time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	s.rotateTo(now)
+
+	inc := int64(interval.Round(time.Second).Seconds())
+
+	s.buckets[s.idx].totalSec += inc
+	if isDown {
+		s.buckets[s.idx].downSec += inc
+	}
+	s.lastUpdate = now
+}
+
+func (s *SlidingSLA) Snapshot() map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var total, down int64
+	for _, b := range s.buckets {
+		total += b.totalSec
+		down += b.downSec
+	}
+
+	if total <= 0 {
+		return map[string]any{
+			"sla_target":     "99.999%",
+			"uptime90":       "100.000%",
+			"total_uptime":   formatDurationFull(0),
+			"total_downtime": formatDurationFull(0),
+			"total_time":     formatDurationFull(0),
+			"sla_breached":   false,
+		}
+	}
+
+	availability := 1.0 - (float64(down) / float64(total))
+	percent := availability * 100
+
+	uptimeStr := fmt.Sprintf("%.3f%%", percent)
+	if down > 0 && uptimeStr == "100.000%" {
+		uptimeStr = "99.999%"
+	}
+
+	breached := (s.Target >= 1.0 && down > 0) || (availability < s.Target)
+	up := total - down
+
+	return map[string]any{
+		"sla_target":     "99.999%",
+		"uptime90":       uptimeStr,
+		"total_uptime":   formatDurationFull(up),
+		"total_downtime": formatDurationFull(down),
+		"total_time":     formatDurationFull(total),
+		"sla_breached":   breached,
+	}
+}
+
+func (s *SlidingSLA) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.buckets {
+		s.buckets[i] = bucket{}
+	}
+	s.idx = 0
+	s.currentMinute = time.Now().UTC().Truncate(24 * time.Hour)
+	s.lastUpdate = time.Now()
+}
+
+func startProbeWorker(ctx context.Context, wg *sync.WaitGroup, t HttpRequest) {
+	defer wg.Done()
+
+	var probeFn func(HttpRequest) ProbeResult
+	switch strings.ToLower(strings.TrimSpace(t.Protocol)) {
+	case "tcp":
+		probeFn = probeTCP
+	case "dns":
+		probeFn = probeDNS
+	default:
+		probeFn = probeHTTP
+	}
+
+	slaTrackers.Lock()
+	tracker := NewSlidingSLA(0.99999)
+	slaTrackers.m[t.Name] = tracker
+
+	existingData := readFromNATS(t.Name)
+	if existingData != nil {
+		var wrapped map[string]any
+		if err := json.Unmarshal(existingData, &wrapped); err == nil {
+			if p, ok := wrapped["payload"].(map[string]any); ok {
+				if sla, ok := p["sla"].(map[string]any); ok {
+					if history, ok := sla["history"].([]any); ok {
+
+						for i := len(history) - 1; i >= 0; i-- {
+							if day, ok := history[i].(map[string]any); ok {
+
+								uptimeStr, _ := day["uptime"].(string)
+								downtimeStr, _ := day["downtime"].(string)
+
+								if uptimeStr != "" && downtimeStr != "" {
+									upSec := parseDurationToSecs(uptimeStr)
+									downSec := parseDurationToSecs(downtimeStr)
+
+									totalSec := upSec + downSec
+
+									if totalSec > 86400 {
+										ratio := 86400.0 / float64(totalSec)
+										totalSec = 86400
+										downSec = int64(float64(downSec) * ratio)
+										upSec = totalSec - downSec
+									}
+
+									tracker.SetState(totalSec, downSec)
+
+									slog.Debug("Restored daily SLA",
+										"name", t.Name,
+										"day_index", i,
+										"total_sec", totalSec,
+										"down_sec", downSec,
+										"uptime", uptimeStr,
+										"downtime", downtimeStr)
+
+									if i > 0 {
+										tracker.mu.Lock()
+										tracker.idx = (tracker.idx + 1) % days90
+										tracker.mu.Unlock()
+									}
+								}
+							}
+						}
+						slog.Info("Memory synced with full history", "name", t.Name, "days_restored", len(history))
+					}
+				}
+			}
+		}
+	}
+
+	slaTrackers.Unlock()
+	ticker := time.NewTicker(t.Interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("Stopping probe worker", "name", t.Name)
+			return
+		case <-ticker.C:
+			res := probeFn(t)
+
+			slaTrackers.Lock()
+			isDown := len(res.State) > 0 && strings.ToLower(res.State[0]) == hr.Down
+			tracker.Tick(isDown, t.Interval)
+			payload := StatusPayload{Probe: res, SLA: tracker.Snapshot()}
+			slaTrackers.Unlock()
+
+			publishToNATS(ctx, t.Name, &payload, tracker)
+			globalHub.Broadcast(map[string]StatusPayload{t.Name: payload})
+		}
+	}
+}
+
+func startProbeManager(ctx context.Context, wg *sync.WaitGroup) {
+	slog.Info("Starting dynamic probe manager...")
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		runningTargets := make(map[string]HttpRequest)
+		probeCancels := make(map[string]context.CancelFunc)
+
+		missingStrikes := make(map[string]int)
+		const maxStrikes = 5
+
+		for {
+			refreshCache(ctx)
+			targetCache.RLock()
+			targets := targetCache.targets
+			targetCache.RUnlock()
+
+			slaTrackers.Lock()
+			for id, running := range runningTargets {
+				var updated HttpRequest
+				var found bool
+				for _, t := range targets {
+					if t.ID == id {
+						found = true
+						updated = t
+						break
+					}
+				}
+
+				if !found {
+					missingStrikes[id]++
+					slog.Warn("Target missing from cache, adding strike", "id", id, "count", missingStrikes[id])
+
+					if missingStrikes[id] >= maxStrikes {
+						slog.Info("Max strikes reached, deleting target", "id", id)
+
+						if cancel, ok := probeCancels[id]; ok {
+							cancel()
+							delete(probeCancels, id)
+						}
+
+						globalHub.Broadcast(map[string]StatusPayload{
+							id: {Probe: ProbeResult{Id: id, Action: []string{"deleted"}}},
+						})
+
+						delete(slaTrackers.m, id)
+						delete(runningTargets, id)
+						delete(missingStrikes, id)
+					}
+				} else {
+					if missingStrikes[id] > 0 {
+						slog.Info("Target reappeared, resetting strikes", "id", id)
+						delete(missingStrikes, id)
+					}
+
+					if running.Host != updated.Host || running.Protocol != updated.Protocol || running.Name != updated.Name {
+						slog.Info("Target updated, restarting worker", "name", id)
+						if cancel, ok := probeCancels[id]; ok {
+							cancel()
+						}
+
+						globalHub.Broadcast(map[string]StatusPayload{
+							id: {Probe: ProbeResult{Id: id, Action: []string{"updated"}}},
+						})
+
+						probeCtx, cancel := context.WithCancel(ctx)
+						probeCancels[id] = cancel
+						wg.Add(1)
+						go startProbeWorker(probeCtx, wg, updated)
+
+						runningTargets[id] = updated
+					}
+				}
+			}
+			slaTrackers.Unlock()
+
+			for _, t := range targets {
+				if _, ok := runningTargets[t.ID]; !ok {
+					probeCtx, cancel := context.WithCancel(ctx)
+					probeCancels[t.ID] = cancel
+
+					wg.Add(1)
+					go startProbeWorker(probeCtx, wg, t)
+
+					runningTargets[t.ID] = t
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func hydrateSnapshotFromKV(ctx context.Context) {
+	keys, err := kv.Keys(ctx)
+	if err != nil {
+		slog.Error("failed to list KV keys", "error", err)
+		return
+	}
+
+	for _, key := range keys {
+		func() {
+			entry, err := kv.Get(ctx, key)
+			if err != nil || entry == nil {
+				return
+			}
+
+			gr, err := gzip.NewReader(bytes.NewReader(entry.Value()))
+			if err != nil {
+				return
+			}
+			defer gr.Close()
+
+			var wrapped map[string]any
+			if err := json.NewDecoder(gr).Decode(&wrapped); err != nil {
+				return
+			}
+
+			payload := StatusPayload{}
+			if p, ok := wrapped["payload"].(map[string]any); ok {
+				b, _ := json.Marshal(p)
+				json.Unmarshal(b, &payload)
+			}
+
+			globalHub.mu.Lock()
+			globalHub.cache[key] = payload
+			globalHub.mu.Unlock()
+		}()
+	}
+
+	slog.Info("SSE snapshot cache hydrated", "items", len(globalHub.cache))
+}
+
+// -------------------- SSE HANDLER --------------------
+type UnboundedChan[T any] struct {
+	InCh  chan T
+	OutCh chan T
+}
+
+func NewUnboundedChan[T any]() *UnboundedChan[T] {
+	uc := &UnboundedChan[T]{
+		InCh:  make(chan T),
+		OutCh: make(chan T),
+	}
+
+	go func() {
+		queue := []T{}
+		var outCh chan T
+		var next T
+		for {
+			if len(queue) > 0 {
+				outCh = uc.OutCh
+				next = queue[0]
+			} else {
+				outCh = nil
+			}
+
+			select {
+			case v, ok := <-uc.InCh:
+				if !ok {
+					close(uc.OutCh)
+					return
+				}
+				queue = append(queue, v)
+			case outCh <- next:
+				queue = queue[1:]
+			}
+		}
+	}()
+
+	return uc
+}
+
+func (uc *UnboundedChan[T]) Close() {
+	close(uc.InCh)
+}
+
+func Sse(w http.ResponseWriter, r *http.Request) {
+
+	ctx := r.Context()
+	w.Header().Set(HeaderAllowOrigin, "*")
+	w.Header().Set(HeaderCacheControl, "no-cache")
+	w.Header().Set(HeaderConnection, "keep-alive")
+	w.Header().Set(HeaderContentType, ContentTypeEventStream)
+
+	conn, err := sse.Upgrade(ctx, w)
+	if err != nil {
+		http.Error(w, err.Error(), StatusInternalServerError)
+		return
+	}
+	defer conn.Close()
+
+	uc := NewUnboundedChan[map[string]StatusPayload]()
+
+	clientChan := uc.OutCh
+	globalHub.AddClient(clientChan)
+	defer globalHub.RemoveClient(clientChan)
+	defer uc.Close()
+
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+
+	targetCache.RLock()
+	lookup := make(map[string]int, len(targetCache.lookup))
+	maps.Copy(lookup, targetCache.lookup)
+	targetCache.RUnlock()
+
+	initialData := make(map[string]StatusPayload)
+	globalHub.mu.RLock()
+	for name, payload := range globalHub.cache {
+		if _, exists := lookup[name]; exists {
+			initialData[name] = payload
+		}
+	}
+	globalHub.mu.RUnlock()
+
+	if len(initialData) > 0 {
+		_ = sendUpdateToConn(ctx, conn, initialData, lookup)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case update := <-clientChan:
+			_ = sendUpdateToConn(ctx, conn, update, lookup)
+		case <-heartbeat.C:
+			_ = conn.SendComment(ctx, "keep-alive")
+		}
+	}
+}
+
+func sendUpdateToConn(ctx context.Context, conn *sse.Conn, update map[string]StatusPayload, lookup map[string]int) error {
+	for name, payload := range update {
+		idx := -1
+		if i, ok := lookup[name]; ok {
+			idx = i
+		}
+
+		out := map[string]any{
+			"index":   idx,
+			"payload": map[string]any{"probe": payload.Probe, "sla": payload.SLA},
+		}
+
+		if err := conn.SendData(ctx, out); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// -------------------- SLA RESET  --------------------
+func ResetHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != MethodGet {
+		http.Error(w, "Method not allowed", StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set(HeaderContentType, ContentTypeJSON)
+
+	name := r.URL.Query().Get("name")
+	empty := r.URL.Query().Get("empty") == "true"
+
+	slaTrackers.Lock()
+	if name != "" {
+		if tracker, ok := slaTrackers.m[name]; ok {
+			tracker.Reset()
+		}
+	} else {
+		for _, tracker := range slaTrackers.m {
+			tracker.Reset()
+		}
+	}
+	slaTrackers.Unlock()
+
+	if empty {
+		w.WriteHeader(StatusNoContent)
+	}
+
+	w.WriteHeader(StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"sla_reset": true,
+		"probe":     name,
+	})
+}
+
+func CreatePage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != MethodPost {
+		http.Error(w, "Method not allowed", StatusMethodNotAllowed)
+		return
+	}
+}
+
+func publishToNATS(ctx context.Context, name string, payload *StatusPayload, s *SlidingSLA) {
+	if nc.Status() != nats.CONNECTED {
+		slog.Error("NATS not connected")
+		return
+	}
+
+	now := time.Now().UTC()
+	todayUTC := now.Format("02/01/2006")
+
+	currentStatus := hr.Warn
+	if len(payload.Probe.State) > 0 {
+		currentStatus = payload.Probe.State[0]
+	}
+
+	targetProbeId := payload.Probe.Id
+	if targetProbeId == "" {
+		targetCache.RLock()
+		for _, t := range targetCache.targets {
+			if t.Name == name {
+				targetProbeId = t.ID
+				break
+			}
+		}
+		targetCache.RUnlock()
+	}
+
+	idx := -1
+	targetCache.RLock()
+	if i, ok := targetCache.lookup[name]; ok {
+		idx = i
+	}
+	targetCache.RUnlock()
+
+	overallSLA := s.Snapshot()
+	totalToday, downToday := s.DailySnapshot()
+
+	availToday := 1.0
+	if totalToday > 0 {
+		availToday = 1.0 - (float64(downToday) / float64(totalToday))
+	}
+
+	dailySnapshot := map[string]any{
+		"sla_breached": downToday > 0,
+		"sla_target":   fmt.Sprintf("%.3f%%", s.Target*100),
+		"downtime":     formatDurationFull(downToday),
+		"uptime":       formatDurationFull(totalToday - downToday),
+		"total_time":   formatDurationFull(totalToday),
+		"uptime90":     fmt.Sprintf("%.3f%%", availToday*100),
+	}
+
+	entry, getErr := kv.Get(ctx, name)
+
+	var revision uint64 = 0
+	var oldPayload StatusPayload
+
+	// Only process existing data if we actually found it
+	if getErr == nil && entry != nil {
+		revision = entry.Revision()
+		gr, err := gzip.NewReader(bytes.NewReader(entry.Value()))
+		if err == nil {
+			var wrapped struct {
+				Payload StatusPayload `json:"payload"`
+			}
+			if json.NewDecoder(gr).Decode(&wrapped) == nil {
+				oldPayload = wrapped.Payload
+			}
+			gr.Close()
+		}
+	}
+
+	newSLA := make(map[string]any)
+
+	if oldPayload.SLA != nil {
+		maps.Copy(newSLA, oldPayload.SLA)
+	}
+
+	if payload.SLA != nil {
+		maps.Copy(newSLA, payload.SLA)
+	}
+
+	if newSLA["id"] == nil || newSLA["id"] == "" {
+		newSLA["id"] = slaId()
+	}
+
+	var newDate []string
+	var newState []string
+	var newHistory []any
+
+	if len(oldPayload.Probe.Date) > 0 {
+		if oldPayload.Probe.Date[0] == todayUTC {
+			newDate = oldPayload.Probe.Date
+			newState = oldPayload.Probe.State
+			if h, ok := oldPayload.SLA["history"].([]any); ok {
+				newHistory = h
+			}
+			if len(newHistory) > 0 {
+				newHistory[0] = dailySnapshot
+			} else {
+				newHistory = []any{dailySnapshot}
+			}
+			if len(newState) > 0 {
+				newState[0] = currentStatus
+			} else {
+				newState = []string{currentStatus}
+			}
+		} else {
+			newDate = append([]string{todayUTC}, oldPayload.Probe.Date...)
+			newState = append([]string{currentStatus}, oldPayload.Probe.State...)
+			if h, ok := oldPayload.SLA["history"].([]any); ok {
+				newHistory = append([]any{dailySnapshot}, h...)
+			} else {
+				newHistory = []any{dailySnapshot}
+			}
+		}
+	} else {
+		newDate = []string{todayUTC}
+		newState = []string{currentStatus}
+		newHistory = []any{dailySnapshot}
+	}
+
+	newSLA["history"] = capSlice(newHistory, 90)
+	newSLA["total_time"] = overallSLA["total_time"]
+	newSLA["total_downtime"] = overallSLA["total_downtime"]
+	newSLA["total_uptime"] = overallSLA["total_uptime"]
+	newSLA["uptime90"] = overallSLA["uptime90"]
+	newSLA["sla_breached"] = overallSLA["sla_breached"]
+
+	newProbe := payload.Probe
+	newProbe.Id = targetProbeId
+	newProbe.Date = capSlice(newDate, 90)
+	newProbe.State = capSlice(newState, 90)
+
+	wrappedPayload := map[string]any{
+		"index": idx,
+		"payload": map[string]any{
+			"probe": newProbe,
+			"sla":   newSLA,
+		},
+	}
+
+	jsonData, err := json.Marshal(wrappedPayload)
+	if err != nil {
+		slog.Error("JSON marshal error", "err", err)
+		return
+	}
+
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	gz.Write(jsonData)
+	gz.Close()
+
+	if revision > 0 {
+		_, err = kv.Update(ctx, name, buf.Bytes(), revision)
+	} else {
+		_, err = kv.Create(ctx, name, buf.Bytes())
+	}
+
+	if err != nil {
+		slog.Error("Failed to write to NATS", "name", name, "error", err)
+		return
+	}
+
+	payload.Probe = newProbe
+	payload.SLA = newSLA
+}
+
+func capSlice[T any](s []T, max int) []T {
+	if len(s) > max {
+		return s[:max]
+	}
+	return s
+}
+
+func readFromNATS(name string) []byte {
+
+	if nc.Status() != nats.CONNECTED {
+		slog.Error("NATS not connected")
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	kv, err := js.KeyValue(ctx, "BEEP_STATUS")
+	if err != nil {
+		slog.Error("Failed to access KV bucket", "error", err)
+		return nil
+	}
+
+	entry, err := kv.Get(ctx, name)
+	if err != nil {
+		slog.Error("Failed to get entry", "key", name, "error", err)
+		return nil
+	}
+
+	reader, err := gzip.NewReader(bytes.NewReader(entry.Value()))
+	if err != nil {
+		slog.Error("Gzip reader error", "error", err)
+		return nil
+	}
+	defer reader.Close()
+
+	decompressed, err := io.ReadAll(reader)
+	if err != nil {
+		slog.Error("Decompression failed", "error", err)
+		return nil
+	}
+
+	var wrapped map[string]any
+	if err := json.Unmarshal(decompressed, &wrapped); err != nil {
+		slog.Error("Unmarshal failed", "error", err)
+		return nil
+	}
+
+	wrappedData, err := json.Marshal(wrapped)
+	if err != nil {
+		slog.Error("Marshal failed", "error", err)
+		return nil
+	}
+
+	return wrappedData
+
+}
+
+func HistoryHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set(HeaderContentType, ContentTypeJSON)
+
+	name := r.URL.Query().Get("name")
+	history := readFromNATS(name)
+
+	if history == nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(history))
+
+}
+
+func RootHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.Redirect(w, r, "https://oddinpay.com", http.StatusTemporaryRedirect)
+		return
+	}
+	http.Redirect(w, r, "https://oddinpay.com", http.StatusTemporaryRedirect)
+}
+
+// -------------------- MAIN --------------------
+func main() {
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var err error
+
+	nc, err = nats.Connect(
+		serverURL,
+		nats.UserJWTAndSeed(jwt, seed),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(5*time.Second),
+		nats.Timeout(10*time.Second),
+		nats.PingInterval(20*time.Second),
+		nats.MaxPingsOutstanding(5),
+		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
+			slog.Warn("Disconnected from NATS", "error", err)
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			slog.Info("Reconnected to NATS", "url", nc.ConnectedUrl())
+		}),
+		nats.ClosedHandler(func(nc *nats.Conn) {
+			slog.Error("NATS connection permanently closed")
+		}),
+	)
+
+	if err != nil {
+		slog.Error("Failed to connect to NATS", "error", err)
+		os.Exit(1)
+	}
+
+	slog.Info("Connected to NATS", "url", serverURL)
+
+	js, err = jetstream.New(nc)
+
+	if err != nil {
+		slog.Error("JetStream context error", "error", err)
+		os.Exit(1)
+	}
+
+	kv, err = js.KeyValue(context.Background(), "BEEP_STATUS")
+	if err != nil {
+		kv, err = js.CreateKeyValue(context.Background(), jetstream.KeyValueConfig{
+			Bucket:   "BEEP_STATUS",
+			MaxBytes: 2 * 1024 * 1024 * 1024,
+			Storage:  jetstream.FileStorage,
+			History:  5,
+		})
+
+		if err != nil {
+			slog.Error("Failed to create KV bucket", "error", err)
+			os.Exit(1)
+		}
+	}
+
+	alertKV, err = js.KeyValue(context.Background(), "OH_STATES")
+	if err != nil {
+		alertKV, err = js.CreateKeyValue(context.Background(), jetstream.KeyValueConfig{
+			Bucket:   "OH_STATES",
+			MaxBytes: 512 * 1024 * 1024,
+			Storage:  jetstream.FileStorage,
+			History:  1,
+		})
+		if err != nil {
+			slog.Error("Failed to create OH_STATES KV bucket", "error", err)
+			os.Exit(1)
+		}
+	}
+
+	hydrateSnapshotFromKV(ctx)
+	startProbeManager(ctx, &wg)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sse", Sse)
+	mux.HandleFunc("/", RootHandler)
+
+	// mux.HandleFunc("GET /v1/status/history", HistoryHandler)
+	// mux.HandleFunc("GET /ping", func(w http.ResponseWriter, r *http.Request) {
+	// 	w.WriteHeader(http.StatusOK)
+	// 	w.Write([]byte("pong"))
+	// })
+
+	originPolicy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, _ := strings.Cut(r.Host, ":")
+		if host != os.Getenv("SSE_API_HOST") {
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte("403 prohibited"))
+			return
+		}
+		recoveryMiddleware(mux).ServeHTTP(w, r)
+	})
+
+	server := &http.Server{
+		Addr:    fmt.Sprintf("%s:%s", Host, Port),
+		Handler: originPolicy,
+	}
+
+	go func() {
+		slog.Info("Ohstatus API server running", "url", fmt.Sprintf("http://%s:%s", Host, Port))
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+			slog.Error("Server failed to start", "error", err)
+			stop()
+		}
+	}()
+
+	slog.Info("Ohstatus is now active and monitoring services.")
+
+	<-ctx.Done()
+
+	slog.Info("Shutdown signal received. Cleaning up...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Error("Server shutdown error", "error", err)
+	}
+
+	wg.Wait()
+
+	if nc != nil {
+		slog.Info("Flushing NATS buffers...")
+		if err := nc.Flush(); err != nil {
+			slog.Error("NATS flush error", "error", err)
+		}
+		nc.Close()
+		slog.Info("NATS connection closed")
+	}
+
+	slog.Info("Shutdown complete. Exiting.")
+	os.Exit(0)
+}

@@ -1,0 +1,2086 @@
+<script lang="ts">
+  import { Button } from "$lib/components/ui/button/index.js";
+  import Buttong from "$lib/components/Buttong.svelte";
+  import * as Tooltip from "$lib/components/ui/tooltip/index.js";
+  import { Skeleton } from "$lib/components/ui/skeleton/index.js";
+  import Footer from "$lib/components/Footer.svelte";
+  import {
+    Tabs,
+    TabsContent,
+    TabsList,
+    TabsTrigger,
+  } from "$lib/components/ui/tabs";
+  import { source } from "sveltekit-sse";
+  import { onMount, onDestroy } from "svelte";
+  import { browser } from "$app/environment";
+  import timer from "$lib/timer";
+  import { env } from "$env/dynamic/public";
+  import { useQuery } from "convex-svelte";
+  import { api } from "../convex/_generated/api";
+  import { page } from "$app/state";
+  import {
+    today,
+    getLocalTimeZone,
+    parseAbsoluteToLocal,
+  } from "@internationalized/date";
+  import Dialog from "$lib/components/Dialog.svelte";
+
+  let { class: className, ...restProps } = $props();
+
+  const query = useQuery(api.site.get);
+  const schedulesQuery = useQuery(api.schedules.get);
+  const incidentsQuery = useQuery(api.incidents.get);
+
+  let signin = "https://oddinpay.com/signin";
+  let signup = "https://oddinpay.com/signup";
+  let slug = "https://oddinpay.com";
+  let logo = "status";
+  let ready = $state(false);
+  const badge = "Last updated";
+
+  onMount(() => (ready = true));
+  const clock = timer();
+
+  const TOTAL_DAYS = 90;
+  const todays = new Date();
+  const end = new Date(
+    Date.UTC(
+      todays.getUTCFullYear(),
+      todays.getUTCMonth(),
+      todays.getUTCDate(),
+    ),
+  );
+
+  const start = new Date(end);
+  start.setUTCDate(end.getUTCDate() - 89);
+
+  type StatusType = "up" | "down" | "warn" | "default";
+
+  interface StatusEntry {
+    date: Date;
+    status: StatusType;
+    downtime: string;
+  }
+
+  interface ApiData {
+    id?: string;
+    name?: string;
+    date?: string[];
+    state?: string[];
+    statuses: StatusEntry[];
+    status?: StatusType;
+    uptime15: string;
+    uptime30: string;
+    uptime60: string;
+    uptime90: string;
+    __order?: number;
+  }
+
+  const oddinHost = env.PUBLIC_SSE_HOST;
+  let unsubscribe: (() => void) | undefined;
+
+  onMount(() => {
+    if (!browser) return;
+
+    const json = source(`https://${oddinHost}/v1/sse`)
+      .select("")
+      .json<ApiData>();
+
+    unsubscribe = json.subscribe((msg: any) => {
+      const probe = msg?.payload?.probe;
+      const sla = msg?.payload?.sla;
+      const index = msg?.index;
+
+      if (!probe?.id) return;
+
+      const id = probe.id;
+
+      if (probe.action?.[0] === "deleted") {
+        delete probeMap[id];
+        return;
+      }
+
+      // Merge the new probe data with the existing data in probeMap
+      probeMap[id] = {
+        ...probeMap[id],
+        ...probe,
+        uptime90: sla?.uptime90 ?? probeMap[id]?.uptime90 ?? "100.000%",
+        __order: index ?? probeMap[id]?.__order ?? Infinity,
+        sla: sla,
+      };
+    });
+  });
+
+  onDestroy(() => {
+    unsubscribe?.();
+  });
+
+  type ProbeMap = Record<string, ApiData>;
+  let probeMap = $state<ProbeMap>({});
+
+  let sortedProbes = $derived(
+    Object.values(probeMap).sort((a, b) =>
+      (a.name ?? "").localeCompare(b.name ?? ""),
+    ),
+  );
+
+  function coerceStatus(s: string): StatusType {
+    return s === "up" || s === "down" || s === "warn" ? s : "warn";
+  }
+
+  function asStatus(s: string): StatusType {
+    return s === "up" || s === "down" || s === "warn" ? s : "default";
+  }
+
+  function currentStatusFor(x: {
+    statuses?: StatusEntry[];
+    status?: StatusType;
+  }): StatusType {
+    if (
+      x?.status &&
+      (x.status === "up" || x.status === "down" || x.status === "warn")
+    ) {
+      return x.status;
+    }
+
+    const arr = Array.isArray(x?.statuses) ? x!.statuses! : [];
+
+    if (arr.length) {
+      const idx = Math.max(0, Math.min(dayIndex, arr.length - 1));
+      const candidate = arr[idx]?.status as StatusType | undefined;
+      return coerceStatus(candidate ?? "default");
+    }
+
+    return coerceStatus(x.status ?? "default");
+  }
+
+  function monitorStatus(x: any): StatusType {
+    const dates = Array.isArray(x?.date) ? x.date : x?.date ? [x.date] : [];
+    const states = Array.isArray(x?.state)
+      ? x.state
+      : x?.state
+        ? [x.state]
+        : [];
+
+    if (dates.length && states.length) {
+      let newestIdx = 0;
+      let newestTime = -Infinity;
+      for (let i = 0; i < dates.length; i++) {
+        const t = +parseDate(dates[i]);
+        if (t > newestTime) {
+          newestTime = t;
+          newestIdx = i;
+        }
+      }
+      return asStatus(states[newestIdx] ?? states[0]);
+    }
+
+    if (Array.isArray(x?.state) && x.state.length) return asStatus(x.state[0]);
+    if (typeof x?.state === "string") return asStatus(x.state);
+    if (typeof x?.status === "string") return asStatus(x.status);
+
+    return "warn";
+  }
+
+  function parseDate(dateString: string | Date): Date {
+    if (dateString instanceof Date) return dateString;
+    if (typeof dateString !== "string") return new Date(String(dateString));
+    const dateOnly = dateString.split(" ")[0];
+    const parts = dateOnly.split("/");
+    if (parts.length !== 3) return new Date(dateString);
+    const [day, month, year] = parts;
+    return new Date(`${year}-${month}-${day}`);
+  }
+
+  function normalizeDates(rawDate: unknown): string[] {
+    if (!rawDate) return [];
+
+    if (Array.isArray(rawDate)) {
+      return rawDate.map((d) => parseDate(d).toLocaleDateString());
+    }
+
+    if (typeof rawDate === "string") {
+      return rawDate
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((s) => parseDate(s).toLocaleDateString());
+    }
+
+    return [parseDate(rawDate as Date | string).toLocaleDateString()];
+  }
+
+  // Classify the status based on downtime string
+
+  function getChipStatus(downtime: string): StatusType {
+    if (!downtime || downtime === "0s") return "up";
+
+    const totalSeconds = parseDowntimeToSeconds(downtime);
+
+    if (totalSeconds <= 300) {
+      return "warn";
+    } else {
+      return "down";
+    }
+  }
+
+  function parseDowntimeToSeconds(downtime: string): number {
+    let totalSeconds = 0;
+
+    const hourMatch = downtime.match(/(\d+)\s*h/);
+    const minuteMatch = downtime.match(/(\d+)\s*m/);
+    const secondMatch = downtime.match(/(\d+)\s*s/);
+
+    if (hourMatch) totalSeconds += parseInt(hourMatch[1]) * 3600;
+    if (minuteMatch) totalSeconds += parseInt(minuteMatch[1]) * 60;
+    if (secondMatch) totalSeconds += parseInt(secondMatch[1]);
+
+    return totalSeconds;
+  }
+
+  let mockData = $derived.by(() => {
+    const probes = sortedProbes;
+
+    const unique = new Map<string, ApiData>();
+    for (const p of probes) {
+      if (!p || !p.id) continue;
+      unique.set(String(p.name), p);
+    }
+    const uniqueProbes = Array.from(unique.values());
+
+    const limitedProbes = uniqueProbes.slice(0, 3);
+
+    return limitedProbes.map((probe) => {
+      const datesList = normalizeDates(probe?.date ?? new Date());
+      const statesList = Array.isArray(probe?.state)
+        ? probe.state
+        : [probe?.state];
+
+      const slaHistory = (probe as any)?.sla?.history || [];
+
+      const datesMap = new Map<string, StatusType>();
+      datesList.forEach((date, index) => {
+        const state = statesList[index] ?? "default";
+        datesMap.set(date, state as StatusType);
+      });
+
+      const statuses: StatusEntry[] = Array.from(
+        { length: TOTAL_DAYS },
+        (_, i) => {
+          const tempDate = new Date(start);
+          tempDate.setUTCDate(start.getUTCDate() + i);
+          const key = tempDate.toLocaleDateString();
+          // const resolved = datesMap.get(key) ?? "default";
+
+          let resolved: StatusType;
+
+          const dateIndex = datesList.findIndex((d) => d === key);
+
+          if (dateIndex !== -1 && dateIndex < slaHistory.length) {
+            const slaEntry = slaHistory[dateIndex];
+
+            const downtime = slaEntry?.downtime || "0s";
+            resolved = getChipStatus(downtime);
+          } else if (dateIndex !== -1) {
+            resolved = asStatus(statesList[dateIndex] || "default");
+          } else {
+            resolved = "default";
+          }
+
+          return {
+            date: tempDate,
+            status: resolved,
+            downtime: slaHistory[dateIndex]?.downtime,
+          };
+        },
+      );
+
+      const api: ApiData = {
+        name: String(probe?.name ?? ""),
+        statuses,
+        status: monitorStatus(probe),
+        uptime15: String(probe?.uptime90 ?? "00.000%"),
+        uptime30: String(probe?.uptime90 ?? "00.000%"),
+        uptime60: String(probe?.uptime90 ?? "00.000%"),
+        uptime90: String(probe?.uptime90 ?? "00.000%"),
+      };
+
+      return api;
+    });
+  });
+
+  let monitors = $derived.by(() => {
+    const apiMap = new Map<
+      string,
+      { title: string; description: string; status: string }
+    >();
+    const probes = sortedProbes;
+    const unique = new Map<string, any>();
+
+    for (const p of probes) {
+      if (!p) continue;
+      unique.set(String(p.name), p);
+      let id = String((p as any).id ?? "");
+      if (!id) continue;
+    }
+
+    const uniqueProbes = Array.from(unique.values());
+    const dataToShow = uniqueProbes.slice(3);
+    const nameCounts = new Map<string, number>();
+
+    for (const api of dataToShow) {
+      if (!api) continue;
+      let id = String((api as any).id ?? "");
+      if (!id) continue;
+
+      if (nameCounts.has(id)) {
+        const count = nameCounts.get(id)! + 1;
+        nameCounts.set(id, count);
+        id = `${id}+${count}`;
+      } else {
+        nameCounts.set(id, 0);
+      }
+
+      apiMap.set(id, {
+        title: String((api as any).name ?? id),
+        description: "API",
+        status: monitorStatus(api),
+      });
+    }
+
+    const apiMonitors = Array.from(apiMap.values());
+
+    const merged = new Map<
+      string,
+      { title: string; description: string; status: string }
+    >();
+    for (const m of apiMonitors) {
+      merged.set(m.title, m);
+    }
+
+    return Array.from(merged.values());
+  });
+
+  const pickStatus = (xs: string[]): StatusType | undefined => {
+    if (xs.includes("down")) return "down";
+    if (xs.includes("warn")) return "warn";
+    if (xs.includes("up")) return "up";
+  };
+
+  let overallStatus = $derived.by<StatusType | undefined>(() => {
+    const allStatuses = [
+      ...sortedProbes.slice(0, 3).map((p) => monitorStatus(p)),
+      ...monitors.map((monitor) => asStatus(monitor.status)),
+    ];
+
+    const computed = pickStatus(allStatuses);
+
+    if (computed !== computed) {
+      return computed;
+    }
+
+    return computed;
+  });
+
+  const dayIndex = Math.floor(
+    (todays.getTime() - start.getTime()) / (1000 * 60 * 60 * 24),
+  );
+
+  function convertUtcToLocal(utcString: string) {
+    const currentUtcDate = today(getLocalTimeZone()).toString();
+
+    const absoluteString = `${currentUtcDate}T${utcString}:00Z`;
+    const localZonedDateTime = parseAbsoluteToLocal(absoluteString);
+
+    const hours = localZonedDateTime.hour.toString().padStart(2, "0");
+    const minutes = localZonedDateTime.minute.toString().padStart(2, "0");
+
+    return `${hours}:${minutes}`;
+  }
+
+  const Indicators = {
+    Resolved: {
+      badge: "resolved",
+      statusLabel: "Resolved",
+    },
+    Investigating: {
+      badge: "investigating",
+      statusLabel: "Investigating",
+    },
+    Scheduled: {
+      badge: "scheduled",
+      statusLabel: "Scheduled",
+    },
+    Identified: {
+      badge: "identified",
+      statusLabel: "Identified",
+    },
+    Inprogress: {
+      badge: "inprogress",
+      statusLabel: "In Progress",
+    },
+
+    Cancelled: {
+      badge: "cancelled",
+      statusLabel: "Cancelled",
+    },
+
+    Completed: {
+      badge: "completed",
+      statusLabel: "Completed",
+    },
+  } as const;
+
+  type Indicator = (typeof Indicators)[keyof typeof Indicators];
+
+  interface IncidentEntry {
+    time: string;
+    description: string;
+    status: Exclude<
+      Indicator,
+      | typeof Indicators.Completed
+      | typeof Indicators.Scheduled
+      | typeof Indicators.Cancelled
+    >;
+  }
+
+  interface MaintenanceEntry {
+    time: string;
+    description: string;
+    status: Exclude<
+      Indicator,
+      | typeof Indicators.Resolved
+      | typeof Indicators.Investigating
+      | typeof Indicators.Identified
+    >;
+  }
+
+  interface Incident {
+    title: string;
+    entries: IncidentEntry[];
+  }
+
+  interface Maintenance {
+    service: string;
+    entries: MaintenanceEntry[];
+  }
+
+  const statusPriority = new Map<Indicator, number>([
+    [Indicators.Completed, 0],
+    [Indicators.Resolved, 0],
+    [Indicators.Inprogress, 1],
+    [Indicators.Identified, 2],
+    [Indicators.Investigating, 3],
+    [Indicators.Scheduled, 3],
+    [Indicators.Cancelled, 0],
+  ]);
+
+  // --- types ---
+  let activeTab = $state("tab-1");
+  let direction = $state<"right" | "left">("right");
+
+  const tabsOrder = ["tab-1", "tab-2"];
+
+  function handleChange(newValue: string) {
+    const oldIndex = tabsOrder.indexOf(activeTab);
+    const newIndex = tabsOrder.indexOf(newValue);
+
+    direction = newIndex > oldIndex ? "left" : "right";
+    activeTab = newValue;
+  }
+
+  // Incidents
+
+  let incidents: Incident[] = $derived.by(() => {
+    $clock;
+
+    const rawData = incidentsQuery.data;
+
+    if (!rawData) return [];
+    const grouped = new Map<string, Incident>();
+
+    rawData.forEach((inci) => {
+      const statusKey = inci.status as keyof typeof Indicators;
+      const indicator = Indicators[statusKey];
+      const groupId = inci.parentId;
+
+      if (!grouped.has(groupId)) {
+        grouped.set(groupId, {
+          title: inci.title,
+          entries: [],
+        });
+      }
+
+      const date = parseAbsoluteToLocal(
+        new Date(inci._creationTime).toISOString(),
+      );
+
+      const formatter = new Intl.DateTimeFormat("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+        timeZone: getLocalTimeZone(),
+      });
+
+      const formatcurrentTime = formatter
+        .format(date.toDate())
+        .replace(/(\d{4}),/, "$1");
+
+      let displayTime = formatcurrentTime;
+
+      grouped.get(groupId)!.entries.push({
+        time: displayTime,
+        status: indicator as IncidentEntry["status"],
+        description: inci.note,
+      });
+    });
+
+    const finalMaintenanceList = Array.from(grouped.values());
+
+    finalMaintenanceList.forEach((m) => {
+      const hasInvestigating = m.entries.some(
+        (e) => e.status === Indicators.Investigating,
+      );
+
+      const hasInProgress = m.entries.some(
+        (e) => e.status === Indicators.Inprogress,
+      );
+      const hasResolved = m.entries.some(
+        (e) => e.status === Indicators.Resolved,
+      );
+      const hasIdentified = m.entries.some(
+        (e) => e.status === Indicators.Identified,
+      );
+
+      m.entries = m.entries
+        .filter((e) => {
+          return true;
+        })
+        .sort(
+          (a, b) =>
+            (statusPriority.get(a.status) ?? Infinity) -
+            (statusPriority.get(b.status) ?? Infinity),
+        );
+    });
+
+    return finalMaintenanceList.filter((m) => m.entries.length > 0);
+  });
+
+  // Maintenance
+
+  let maintenances: Maintenance[] = $derived.by(() => {
+    $clock;
+
+    const rawData = schedulesQuery.data;
+
+    if (!rawData) return [];
+    const grouped = new Map<string, Maintenance>();
+
+    rawData.forEach((sched) => {
+      const statusKey = sched.status as keyof typeof Indicators;
+      const indicator = Indicators[statusKey];
+      const groupId = sched.parentId;
+
+      if (!grouped.has(groupId)) {
+        grouped.set(groupId, {
+          service: sched.service,
+          entries: [],
+        });
+      }
+
+      const date = parseAbsoluteToLocal(
+        new Date(sched._creationTime).toISOString(),
+      );
+
+      const formatter = new Intl.DateTimeFormat("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+        timeZone: getLocalTimeZone(),
+      });
+
+      const formatcurrentTime = formatter
+        .format(date.toDate())
+        .replace(/(\d{4}),/, "$1");
+
+      const groupRecords = rawData.filter((r) => r.parentId === groupId);
+
+      const hasAdvancedStatus = groupRecords.some((r) => {
+        const s = r.status?.toLowerCase();
+        return s === "completed" || s === "cancelled";
+      });
+
+      let displayTime = formatcurrentTime;
+      const isScheduled = sched.status?.toLowerCase() === "scheduled";
+
+      if (isScheduled && !hasAdvancedStatus && sched.date && sched.time) {
+        const localStartDate = sched.date.split(" - ")[0];
+        const localEndDate = sched.date.split(" - ")[1];
+
+        const localStartTime = convertUtcToLocal(sched.time.split(" - ")[0]);
+        const localEndTime = convertUtcToLocal(sched.time.split(" - ")[1]);
+
+        displayTime = `${localStartDate} ${localStartTime} - ${localEndDate} ${localEndTime}`;
+      }
+
+      grouped.get(groupId)!.entries.push({
+        time: displayTime,
+        status: indicator as MaintenanceEntry["status"],
+        description: sched.note,
+      });
+    });
+
+    const finalMaintenanceList = Array.from(grouped.values());
+
+    finalMaintenanceList.forEach((m) => {
+      const hasScheduled = m.entries.some(
+        (e) => e.status === Indicators.Scheduled,
+      );
+
+      const hasInProgress = m.entries.some(
+        (e) => e.status === Indicators.Inprogress,
+      );
+      const hasCompleted = m.entries.some(
+        (e) => e.status === Indicators.Completed,
+      );
+      const hasCancelled = m.entries.some(
+        (e) => e.status === Indicators.Cancelled,
+      );
+
+      m.entries = m.entries
+        .filter((e) => {
+          if (!hasScheduled) return false;
+
+          if (hasCompleted && !hasInProgress) return false;
+
+          if (e.status === Indicators.Cancelled) {
+            const wasScheduled = m.entries.some(
+              (entry) => entry.status === Indicators.Scheduled,
+            );
+            if (!wasScheduled) return false;
+          }
+
+          const isScheduledWhileInProgress =
+            hasInProgress &&
+            !hasCancelled &&
+            !hasCompleted &&
+            e.status === Indicators.Scheduled;
+
+          const isCompletedWhileCancelled =
+            hasCancelled &&
+            (e.status === Indicators.Completed ||
+              e.status === Indicators.Inprogress);
+
+          return !isScheduledWhileInProgress && !isCompletedWhileCancelled;
+        })
+        .sort(
+          (a, b) =>
+            (statusPriority.get(a.status) ?? Infinity) -
+            (statusPriority.get(b.status) ?? Infinity),
+        );
+    });
+
+    return finalMaintenanceList.filter((m) => m.entries.length > 0);
+  });
+
+  let tooltipOpen = $state<Record<number, boolean>>({});
+
+  function toggleTooltip(index: number) {
+    tooltipOpen[index] = !tooltipOpen[index];
+  }
+</script>
+
+{#if ready}
+  <div class="min-h-screen bg-white text-black">
+    <!-- Navbar -->
+    <header
+      class="fixed w-full top-0 z-40 h-14 border-b border-black/5 backdrop-blur bg-white/50"
+    >
+      <div
+        class="mx-auto max-w-screen-2xl px-4 sm:px-6 lg:px-8 h-full flex items-center gap-3"
+      >
+        <button
+          id="navToggle"
+          class="xl:hidden p-2 rounded-lg hover:bg-black/5 dark:hover:bg:white/10"
+          aria-label="Toggle nav"
+        >
+          <span class="block w-5 h-0.5 bg-current mb-1"></span>
+          <span class="block w-5 h-0.5 bg-current mb-1"></span>
+          <span class="block w-5 h-0.5 bg-current"></span>
+        </button>
+
+        <div class="ohstatus hover:opacity-50">
+          {#if page.url.hostname === "status.oddinpay.com"}
+            <a href={slug} target="_blank" rel="noopener noreferrer">
+              {logo}
+            </a>
+          {:else if query.isLoading}
+            <Skeleton class="h-8 w-30 bg-gray-300 rounded-md" />
+          {:else if query.data}
+            {#each query.data as site}
+              <a href={site.slug} target="_blank" rel="noopener noreferrer">
+                {#if page.url.hostname === "status.oddinpay.com"}
+                  {logo}
+                {:else if site.textLogo}
+                  {site.textLogo}
+                {:else}
+                  {logo}
+                {/if}
+              </a>
+            {/each}
+          {/if}
+        </div>
+
+        <div id="themeBtn" class="ml-auto"></div>
+        {#if page.url.hostname === "status.oddinpay.com"}
+          <Button
+            id="change"
+            onclick={() => window.open(signin, "_blank")}
+            class="text-black hidden stm:block cursor-pointer hover:text-green-700"
+            variant="ghost"
+          >
+            Sign in
+          </Button>
+          <Buttong url={signup} />
+        {:else if query.isLoading}
+          <Skeleton class="h-8 w-20 bg-gray-300 rounded-md" />
+        {:else if query.data}
+          {#each query.data as site}
+            <Button
+              id="change"
+              onclick={() => window.open(site.signinUrl, "_blank")}
+              class="text-black hidden stm:block cursor-pointer hover:text-green-700"
+              variant="ghost"
+            >
+              Sign in
+            </Button>
+            <Buttong url={site.signupUrl} />
+          {/each}
+        {/if}
+      </div>
+    </header>
+    <div id="navBackdrop" class="hidden fixed inset-0 bg-black/40 z-40"></div>
+    <!-- MAIN CONTENT -->
+    <main class="min-w-0">
+      <div class="relative p-5">
+        <article id="content" class="markdown-body p-5 max-w-5xl">
+          <div class="flex flex-col justify-center">
+            <div class="py-25">
+              <div class="wrapper-ui">
+                <div class="child-wrapper-ui">
+                  <div class="headline-container">
+                    {#if overallStatus === "up"}
+                      <svg
+                        class="w-20 h-20 mx-auto"
+                        xmlns="http://www.w3.org/2000/svg"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          fill="#21ba45"
+                          fill-rule="evenodd"
+                          d="M22 12c0 5.523-4.477 10-10 10S2 17.523 2 12S6.477 2 12 2s10 4.477 10 10m-5.97-3.03a.75.75 0 0 1 0 1.06l-5 5a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 1 1 1.06-1.06l1.47 1.47l2.235-2.235L14.97 8.97a.75.75 0 0 1 1.06 0"
+                          clip-rule="evenodd"
+                        />
+                      </svg>
+                    {:else if overallStatus === "warn"}
+                      <svg
+                        class="w-20 h-20 mx-auto"
+                        xmlns="http://www.w3.org/2000/svg"
+                        viewBox="0 0 20 20"
+                      >
+                        <path
+                          fill="#d97706"
+                          d="M10 2c4.42 0 8 3.58 8 8s-3.58 8-8 8s-8-3.58-8-8s3.58-8 8-8m1.13 9.38l.35-6.46H8.52l.35 6.46zm-.09 3.36c.24-.23.37-.55.37-.96c0-.42-.12-.74-.36-.97s-.59-.35-1.06-.35s-.82.12-1.07.35s-.37.55-.37.97c0 .41.13.73.38.96c.26.23.61.34 1.06.34s.8-.11 1.05-.34"
+                        />
+                      </svg>
+                    {:else if overallStatus === "down"}
+                      <svg
+                        class="w-20 h-20 mx-auto"
+                        xmlns="http://www.w3.org/2000/svg"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          fill="#db2828"
+                          d="M12 2c5.53 0 10 4.47 10 10s-4.47 10-10 10S2 17.53 2 12S6.47 2 12 2m3.59 5L12 10.59L8.41 7L7 8.41L10.59 12L7 15.59L8.41 17L12 13.41L15.59 17L17 15.59L13.41 12L17 8.41z"
+                        />
+                      </svg>
+                    {:else}
+                      <div
+                        role="status"
+                        class="profile shimmer w-20 h-20 bg-gray-300"
+                      ></div>
+                    {/if}
+
+                    <h1
+                      id="content"
+                      class="headline8"
+                      style="font-size: clamp(2.5rem, 3vh, 5rem);"
+                    >
+                      {#if overallStatus === "up"}
+                        All Systems Operational
+                      {:else if overallStatus === "warn"}
+                        System Outage Detected
+                      {:else if overallStatus === "down"}
+                        Critical Issues Detected
+                      {:else}
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          width="48"
+                          height="48"
+                          viewBox="0 0 24 24"
+                          ><circle cx="18" cy="12" r="0" fill="currentColor"
+                            ><animate
+                              attributeName="r"
+                              begin=".67"
+                              calcMode="spline"
+                              dur="1.5s"
+                              keySplines="0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8"
+                              repeatCount="indefinite"
+                              values="0;2;0;0"
+                            /></circle
+                          ><circle cx="12" cy="12" r="0" fill="currentColor"
+                            ><animate
+                              attributeName="r"
+                              begin=".33"
+                              calcMode="spline"
+                              dur="1.5s"
+                              keySplines="0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8"
+                              repeatCount="indefinite"
+                              values="0;2;0;0"
+                            /></circle
+                          ><circle cx="6" cy="12" r="0" fill="currentColor"
+                            ><animate
+                              attributeName="r"
+                              begin="0"
+                              calcMode="spline"
+                              dur="1.5s"
+                              keySplines="0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8"
+                              repeatCount="indefinite"
+                              values="0;2;0;0"
+                            /></circle
+                          ></svg
+                        >
+                      {/if}
+                    </h1>
+                    <p
+                      class="text-base text-gray-500 font-bold text-center sm:text-left"
+                    >
+                      <span class="text-lg">
+                        {$clock}
+                      </span>
+                    </p>
+                    <span class="text-base mt-5 text-center sm:text-left">
+                      <span
+                        class="inline-flex pointer-events-none items-center px-4 py-0.5 rounded-full text-sm font-semibold no-underline"
+                        style=" 
+  border: 1px solid {overallStatus === 'up'
+                          ? '#a6eb84'
+                          : overallStatus === 'warn'
+                            ? '#ffddb3'
+                            : overallStatus === 'down'
+                              ? '#f05d5e'
+                              : '#d1d5db'}; 
+  text-decoration: none; 
+  background-color: {overallStatus === 'up'
+                          ? '#d7f7c2'
+                          : overallStatus === 'warn'
+                            ? '#fff4e5'
+                            : overallStatus === 'down'
+                              ? '#fddede'
+                              : '#f3f4f6'}; 
+  color: {overallStatus === 'up'
+                          ? '#006908'
+                          : overallStatus === 'warn'
+                            ? '#b45309'
+                            : overallStatus === 'down'
+                              ? '#db2828'
+                              : '#4b5563'}; 
+                        "
+                      >
+                        {badge}
+                      </span>
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="legend mt-2">
+                <strong class="text-sm text-zinc-500">Legend:</strong>
+                <span class="text-green-800">
+                  <svg
+                    class="w-5 h-5 inline-block"
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      fill="#21ba45"
+                      fill-rule="evenodd"
+                      d="M22 12c0 5.523-4.477 10-10 10S2 17.523 2 12S6.477 2 12 2s10 4.477 10 10m-5.97-3.03a.75.75 0 0 1 0 1.06l-5 5a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 1 1 1.06-1.06l1.47 1.47l2.235-2.235L14.97 8.97a.75.75 0 0 1 1.06 0"
+                      clip-rule="evenodd"
+                    />
+                  </svg>
+                  Operational
+                </span>
+                <span class="text-amber-700">
+                  <svg
+                    class="w-5 h-5 inline-block"
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="20"
+                    height="20"
+                    viewBox="0 0 20 20"
+                  >
+                    <path
+                      fill="#d97706"
+                      d="M10 2c4.42 0 8 3.58 8 8s-3.58 8-8 8s-8-3.58-8-8s3.58-8 8-8m1.13 9.38l.35-6.46H8.52l.35 6.46zm-.09 3.36c.24-.23.37-.55.37-.96c0-.42-.12-.74-.36-.97s-.59-.35-1.06-.35s-.82.12-1.07.35s-.37.55-.37.97c0 .41.13.73.38.96c.26.23.61.34 1.06.34s.8-.11 1.05-.34"
+                    />
+                  </svg>
+                  Partial degradation
+                </span>
+                <span class="text-red-600">
+                  <svg
+                    class="w-5 h-5 inline-block"
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      fill="#db2828"
+                      d="M12 2c5.53 0 10 4.47 10 10s-4.47 10-10 10S2 17.53 2 12S6.47 2 12 2m3.59 5L12 10.59L8.41 7L7 8.41L10.59 12L7 15.59L8.41 17L12 13.41L15.59 17L17 15.59L13.41 12L17 8.41z"
+                    />
+                  </svg>
+                  Severe degradation
+                </span>
+              </div>
+
+              <div aria-hidden="true">
+                <div class="relative left-1/2 -translate-x-1/2 w-screen"></div>
+              </div>
+
+              <Tabs
+                value={activeTab}
+                class="items-left p-5"
+                onValueChange={handleChange}
+              >
+                <div class="flex items-center justify-between w-full">
+                  <TabsList
+                    class="border-border text-foreground h-auto gap-2 rounded-none border-b bg-transparent px-0 py-1"
+                  >
+                    {#each tabsOrder as t, i}
+                      <TabsTrigger
+                        value={t}
+                        class={`cursor-pointer hover:bg-accent hover:text-foreground transition-colors duration-150 ease-in-out data-[state=active]:hover:bg-accent relative after:absolute after:inset-x-0 after:bottom-0 after:-mb-1 after:h-0.5 after:transform after:scale-x-0 after:transition-transform after:duration-200 after:ease-in-out data-[state=active]:after:scale-x-100 data-[state=active]:after:bg-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none ${
+                          direction === "left"
+                            ? "after:origin-left"
+                            : "after:origin-right"
+                        }`}
+                      >
+                        {#if i === 0}
+                          <span
+                            class={activeTab === t
+                              ? "text-black font-semibold"
+                              : "text-gray-500 font-semibold"}>Live status</span
+                          >
+                        {:else if i === 1}
+                          <span
+                            class={activeTab === t
+                              ? "text-black font-semibold"
+                              : "text-zinc-500 font-semibold"}>History</span
+                          >
+                        {/if}
+                      </TabsTrigger>
+                    {/each}
+                  </TabsList>
+
+                  <div class="ml-auto">
+                    <Dialog />
+                  </div>
+                </div>
+
+                {#each tabsOrder as t, i}
+                  <TabsContent value={t}>
+                    {#if i === 0}
+                      {#if mockData.length === 0}
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          width="48"
+                          height="48"
+                          viewBox="0 0 24 24"
+                          ><circle cx="18" cy="12" r="0" fill="currentColor"
+                            ><animate
+                              attributeName="r"
+                              begin=".67"
+                              calcMode="spline"
+                              dur="1.5s"
+                              keySplines="0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8"
+                              repeatCount="indefinite"
+                              values="0;2;0;0"
+                            /></circle
+                          ><circle cx="12" cy="12" r="0" fill="currentColor"
+                            ><animate
+                              attributeName="r"
+                              begin=".33"
+                              calcMode="spline"
+                              dur="1.5s"
+                              keySplines="0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8"
+                              repeatCount="indefinite"
+                              values="0;2;0;0"
+                            /></circle
+                          ><circle cx="6" cy="12" r="0" fill="currentColor"
+                            ><animate
+                              attributeName="r"
+                              begin="0"
+                              calcMode="spline"
+                              dur="1.5s"
+                              keySplines="0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8"
+                              repeatCount="indefinite"
+                              values="0;2;0;0"
+                            /></circle
+                          ></svg
+                        >
+                      {:else}
+                        {#each mockData as api, index}
+                          <section class="card" style="margin-bottom: 2px;">
+                            <div class="card-header">
+                              <div
+                                style="display: flex; align-items: center; gap: 5px;"
+                              >
+                                {#if currentStatusFor(api) === "up"}
+                                  <svg
+                                    class="w-5 h-5"
+                                    xmlns="http://www.w3.org/2000/svg"
+                                    viewBox="0 0 24 24"
+                                  >
+                                    <path
+                                      fill="#21ba45"
+                                      fill-rule="evenodd"
+                                      d="M22 12c0 5.523-4.477 10-10 10S2 17.523 2 12S6.477 2 12 2s10 4.477 10 10m-5.97-3.03a.75.75 0 0 1 0 1.06l-5 5a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 1 1 1.06-1.06l1.47 1.47l2.235-2.235L14.97 8.97a.75.75 0 0 1 1.06 0"
+                                      clip-rule="evenodd"
+                                    />
+                                  </svg>
+                                {:else if currentStatusFor(api) === "warn"}
+                                  <svg
+                                    class="w-5 h-5"
+                                    xmlns="http://www.w3.org/2000/svg"
+                                    viewBox="0 0 20 20"
+                                  >
+                                    <path
+                                      fill="#d97706"
+                                      d="M10 2c4.42 0 8 3.58 8 8s-3.58 8-8 8s-8-3.58-8-8s3.58-8 8-8m1.13 9.38l.35-6.46H8.52l.35 6.46zm-.09 3.36c.24-.23.37-.55.37-.96c0-.42-.12-.74-.36-.97s-.59-.35-1.06-.35s-.82.12-1.07.35s-.37.55-.37.97c0 .41.13.73.38.96c.26.23.61.34 1.06.34s.8-.11 1.05-.34"
+                                    />
+                                  </svg>
+                                {:else if currentStatusFor(api) === "down"}
+                                  <svg
+                                    class="w-5 h-5"
+                                    xmlns="http://www.w3.org/2000/svg"
+                                    viewBox="0 0 24 24"
+                                  >
+                                    <path
+                                      fill="#db2828"
+                                      d="M12 2c5.53 0 10 4.47 10 10s-4.47 10-10 10S2 17.53 2 12S6.47 2 12 2m3.59 5L12 10.59L8.41 7L7 8.41L10.59 12L7 15.59L8.41 17L12 13.41L15.59 17L17 15.59L13.41 12L17 8.41z"
+                                    />
+                                  </svg>
+                                {/if}
+                                <div class="text-lg">{api.name}</div>
+                              </div>
+                              <div class="uptimes">
+                                <span class="uptime15"
+                                  >{api.uptime15} uptime</span
+                                >
+                                <span class="uptime30"
+                                  >{api.uptime30} uptime</span
+                                >
+                                <span class="uptime60"
+                                  >{api.uptime60} uptime</span
+                                >
+                                <span class="uptime90"
+                                  >{api.uptime90} uptime</span
+                                >
+                              </div>
+                            </div>
+                            <Tooltip.Provider delayDuration={100}>
+                              <div class="bar">
+                                {#each api.statuses as s, i}
+                                  <Tooltip.Root>
+                                    <Tooltip.Trigger>
+                                      {#snippet child({ props })}
+                                        <div
+                                          {...props}
+                                          onclick={() => toggleTooltip(i)}
+                                          ontouchstart={(e) => {
+                                            e.preventDefault();
+                                            toggleTooltip(i);
+                                          }}
+                                          class="chip {s.status} {i === dayIndex
+                                            ? s.status
+                                            : ''}"
+                                        ></div>
+                                      {/snippet}
+                                    </Tooltip.Trigger>
+
+                                    <Tooltip.Content
+                                      style="box-shadow: rgba(0, 0, 0, 0.02) 0px 1px 3px 0px, rgba(27, 31, 35, 0.15) 0px 0px 0px 1px;"
+                                      class="bg-[#0F172A] rounded-md text-white p-2"
+                                    >
+                                      <div
+                                        class="flex flex-col items-center justify-center p-2 text-sm"
+                                      >
+                                        <span
+                                          class="text-medium font-medium text-white mb-1"
+                                        >
+                                          {new Date(s.date).toLocaleDateString(
+                                            "en-US",
+                                            { month: "short", day: "numeric" },
+                                          )}
+                                        </span>
+
+                                        {#if s.status === "up"}
+                                          <span
+                                            class="{s.status === 'up'
+                                              ? 'text-lime-400'
+                                              : 'text-slate-300'} text-sm"
+                                          >
+                                            Operational
+                                          </span>
+                                        {:else if s.status === "warn"}
+                                          <span class="text-yellow-400 text-sm">
+                                            Outage {s.downtime}
+                                          </span>
+                                        {:else if s.status === "down"}
+                                          <span class="text-red-400 text-sm">
+                                            Down {s.downtime}
+                                          </span>
+                                        {:else}
+                                          <span
+                                            class="text-slate-300 font-medium text-sm"
+                                          >
+                                            No data
+                                          </span>
+                                        {/if}
+                                      </div>
+                                    </Tooltip.Content>
+                                  </Tooltip.Root>
+                                {/each}
+                              </div>
+                            </Tooltip.Provider>
+                            <div class="timeline">
+                              <span class="label15 text-zinc-500"
+                                >15 days ago</span
+                              >
+                              <span class="label30 text-zinc-500"
+                                >30 days ago</span
+                              >
+                              <span class="label60 text-zinc-500"
+                                >60 days ago</span
+                              >
+                              <span class="label90 text-zinc-500"
+                                >90 days ago</span
+                              >
+                              <span class="text-zinc-500">Today</span>
+                            </div>
+                          </section>
+                        {/each}
+                      {/if}
+
+                      <div class="status-page">
+                        <div class="left">
+                          <h2>System status</h2>
+                          {#if monitors.length < 3 && monitors.length === 0}
+                            No monitors to display.
+                          {:else if monitors.length === 0}
+                            <svg
+                              xmlns="http://www.w3.org/2000/svg"
+                              width="24"
+                              height="24"
+                              viewBox="0 0 24 24"
+                            >
+                              <path
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-linecap="round"
+                                stroke-width="2"
+                                d="M12 6.99998C9.1747 6.99987 6.99997 9.24998 7 12C7.00003 14.55 9.02119 17 12 17C14.7712 17 17 14.75 17 12"
+                                ><animateTransform
+                                  attributeName="transform"
+                                  attributeType="XML"
+                                  dur="560ms"
+                                  from="0,12,12"
+                                  repeatCount="indefinite"
+                                  to="360,12,12"
+                                  type="rotate"
+                                />
+                              </path>
+                            </svg>
+                          {:else if monitors.length === 0}
+                            No monitors to display.
+                          {:else}
+                            {#each monitors as status}
+                              <div class="status-card">
+                                <div
+                                  style="display: flex; align-items: center; gap: 10px;"
+                                >
+                                  {#if status.status === "up"}
+                                    <svg
+                                      class="w-10 h-10 inline-block"
+                                      xmlns="http://www.w3.org/2000/svg"
+                                      viewBox="0 0 24 24"
+                                    >
+                                      <path
+                                        fill="#21ba45"
+                                        fill-rule="evenodd"
+                                        d="M22 12c0 5.523-4.477 10-10 10S2 17.523 2 12S6.477 2 12 2s10 4.477 10 10m-5.97-3.03a.75.75 0 0 1 0 1.06l-5 5a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 1 1 1.06-1.06l1.47 1.47l2.235-2.235L14.97 8.97a.75.75 0 0 1 1.06 0"
+                                        clip-rule="evenodd"
+                                      />
+                                    </svg>
+                                  {:else if status.status === "warn"}
+                                    <svg
+                                      class="w-10 h-10 inline-block"
+                                      xmlns="http://www.w3.org/2000/svg"
+                                      viewBox="0 0 20 20"
+                                    >
+                                      <path
+                                        fill="#d97706"
+                                        d="M10 2c4.42 0 8 3.58 8 8s-3.58 8-8 8s-8-3.58-8-8s3.58-8 8-8m1.13 9.38l.35-6.46H8.52l.35 6.46zm-.09 3.36c.24-.23.37-.55.37-.96c0-.42-.12-.74-.36-.97s-.59-.35-1.06-.35s-.82.12-1.07.35s-.37.55-.37.97c0 .41.13.73.38.96c.26.23.61.34 1.06.34s.8-.11 1.05-.34"
+                                      />
+                                    </svg>
+                                  {:else if status.status === "down"}
+                                    <svg
+                                      class="w-10 h-10 inline-block"
+                                      xmlns="http://www.w3.org/2000/svg"
+                                      viewBox="0 0 24 24"
+                                    >
+                                      <path
+                                        fill="#db2828"
+                                        d="M12 2c5.53 0 10 4.47 10 10s-4.47 10-10 10S2 17.53 2 12S6.47 2 12 2m3.59 5L12 10.59L8.41 7L7 8.41L10.59 12L7 15.59L8.41 17L12 13.41L15.59 17L17 15.59L13.41 12L17 8.41z"
+                                      />
+                                    </svg>
+                                  {/if}
+                                  <div>
+                                    <strong>{status.title}</strong>
+                                    <p class="monitors" style="color: #666;">
+                                      {status.description}
+                                    </p>
+                                  </div>
+                                </div>
+                              </div>
+                            {/each}
+                          {/if}
+                        </div>
+
+                        <div class="right">
+                          <h2>Recent incidents</h2>
+                          {#if incidents.every( (incident) => incident.entries.some((entry) => entry.status === Indicators.Resolved) )}
+                            No incidents reported.
+                          {:else}
+                            {#each incidents as incident}
+                              {#if !incident.entries.some((entry) => entry.status === Indicators.Resolved)}
+                                <div class="incident-card flex flex-col gap-2">
+                                  {#each incident.entries as entry}
+                                    <div class="status-entry">
+                                      <span class="time font-bold"
+                                        >{entry.time}</span
+                                      >
+                                      <span
+                                        class="badge mt-1 {entry.status.badge}"
+                                      >
+                                        {entry.status.statusLabel}
+                                      </span>
+                                      <p
+                                        class="mt-2 text-gray-600"
+                                        style="font-size: 16px"
+                                      >
+                                        {entry.description}
+                                      </p>
+                                    </div>
+                                  {/each}
+                                </div>
+                              {/if}
+                            {/each}
+                          {/if}
+                          <h2>Maintenance</h2>
+                          <div class="maintenance-list">
+                            {#if schedulesQuery.isLoading}
+                              <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                width="48"
+                                height="48"
+                                viewBox="0 0 24 24"
+                              >
+                                <circle
+                                  cx="18"
+                                  cy="12"
+                                  r="0"
+                                  fill="currentColor"
+                                >
+                                  <animate
+                                    attributeName="r"
+                                    begin=".67"
+                                    calcMode="spline"
+                                    dur="1.5s"
+                                    keySplines="0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8"
+                                    repeatCount="indefinite"
+                                    values="0;2;0;0"
+                                  />
+                                </circle>
+                                <circle
+                                  cx="12"
+                                  cy="12"
+                                  r="0"
+                                  fill="currentColor"
+                                >
+                                  <animate
+                                    attributeName="r"
+                                    begin=".33"
+                                    calcMode="spline"
+                                    dur="1.5s"
+                                    keySplines="0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8"
+                                    repeatCount="indefinite"
+                                    values="0;2;0;0"
+                                  />
+                                </circle>
+                                <circle
+                                  cx="6"
+                                  cy="12"
+                                  r="0"
+                                  fill="currentColor"
+                                >
+                                  <animate
+                                    attributeName="r"
+                                    begin="0"
+                                    calcMode="spline"
+                                    dur="1.5s"
+                                    keySplines="0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8"
+                                    repeatCount="indefinite"
+                                    values="0;2;0;0"
+                                  />
+                                </circle>
+                              </svg>
+                            {:else if maintenances.length === 0 || maintenances.every( (incident) => incident.entries.some((entry) => entry.status === Indicators.Completed || entry.status === Indicators.Cancelled) )}
+                              No maintenance scheduled.
+                            {:else if schedulesQuery.data}
+                              {#each maintenances as maintenance}
+                                {#if maintenance.entries.length > 0}
+                                  {#if !maintenance.entries.some((entry) => entry.status === Indicators.Completed || entry.status === Indicators.Cancelled)}
+                                    {#each maintenance.entries as entry}
+                                      <div class="flex items-center p-3 gap-4">
+                                        <span
+                                          class="inline-flex items-center px-2.5 badge2 py-1 rounded-full text-xs font-medium {entry
+                                            .status.badge}"
+                                        >
+                                          {entry.status.statusLabel}
+                                        </span>
+                                        <div
+                                          class="flex flex-col text-left leading-tight"
+                                        >
+                                          <span
+                                            class="text-base font-semibold text-(--inactive-service)"
+                                          >
+                                            {maintenance.service}
+                                          </span>
+                                          <time
+                                            class="text-base text-(--inactive)"
+                                          >
+                                            {entry.time}
+                                          </time>
+                                        </div>
+                                      </div>
+                                    {/each}
+                                  {/if}
+                                {/if}
+                              {/each}
+                            {/if}
+                          </div>
+                        </div>
+                      </div>
+                    {:else if i === 1}
+                      {#if schedulesQuery.isLoading}
+                        <div class="flex-center">
+                          <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            width="48"
+                            height="48"
+                            viewBox="0 0 24 24"
+                          >
+                            <circle cx="18" cy="12" r="0" fill="currentColor">
+                              <animate
+                                attributeName="r"
+                                begin=".67"
+                                calcMode="spline"
+                                dur="1.5s"
+                                keySplines="0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8"
+                                repeatCount="indefinite"
+                                values="0;2;0;0"
+                              />
+                            </circle>
+                            <circle cx="12" cy="12" r="0" fill="currentColor">
+                              <animate
+                                attributeName="r"
+                                begin=".33"
+                                calcMode="spline"
+                                dur="1.5s"
+                                keySplines="0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8"
+                                repeatCount="indefinite"
+                                values="0;2;0;0"
+                              />
+                            </circle>
+                            <circle cx="6" cy="12" r="0" fill="currentColor">
+                              <animate
+                                attributeName="r"
+                                begin="0"
+                                calcMode="spline"
+                                dur="1.5s"
+                                keySplines="0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8;0.2 0.2 0.4 0.8"
+                                repeatCount="indefinite"
+                                values="0;2;0;0"
+                              />
+                            </circle>
+                          </svg>
+                        </div>
+                      {:else if (incidents.length === 0 && maintenances.length === 0) || (!incidents.some( (i) => i.entries.some((e) => e.status === Indicators.Resolved) ) && !maintenances.some( (m) => m.entries.some((e) => e.status === Indicators.Completed || e.status === Indicators.Cancelled) ))}
+                        <p
+                          class="p-10 text-black text-center"
+                          style="font-size: 16px"
+                        >
+                          No historical data available.
+                        </p>
+                      {/if}
+                      {#each incidents as incident}
+                        {#if incident.entries.some((entry) => entry.status === Indicators.Resolved)}
+                          <div class="incident-card mt-10">
+                            <h2>{incident.title}</h2>
+                            {#each incident.entries as entry}
+                              <div class="status-entry">
+                                <span class="time font-bold">{entry.time}</span>
+                                <span class="badge mt-1 {entry.status.badge}">
+                                  {entry.status.statusLabel}
+                                </span>
+                                <p
+                                  class="mt-2 text-gray-600"
+                                  style="font-size: 16px"
+                                >
+                                  {entry.description}
+                                </p>
+                              </div>
+                            {/each}
+                          </div>
+                        {/if}
+                      {/each}
+
+                      {#each maintenances as maintenance}
+                        {#if maintenance.entries.some((entry) => entry.status === Indicators.Completed || entry.status === Indicators.Cancelled)}
+                          <div class="incident-card mt-10">
+                            <h2>
+                              Scheduled maintenance for {maintenance.service}
+                            </h2>
+                            {#each maintenance.entries as entry}
+                              <div class="status-entry">
+                                <span class="time font-bold">{entry.time}</span>
+                                <span class="badge mt-1 {entry.status.badge}">
+                                  {entry.status.statusLabel}
+                                </span>
+                                <p
+                                  class="mt-2 text-gray-600"
+                                  style="font-size: 16px"
+                                >
+                                  System affected: {maintenance.service}
+                                </p>
+                              </div>
+                            {/each}
+                          </div>
+                        {/if}
+                      {/each}
+                    {/if}
+                  </TabsContent>
+                {/each}
+              </Tabs>
+            </div>
+          </div>
+        </article>
+        <div aria-hidden="true" class="h-37.5"></div>
+      </div>
+    </main>
+  </div>
+
+  {#if page.url.hostname === "status.oddinpay.com"}
+    <Footer
+      privacy={"https://oddinpay.com/privacy"}
+      site={"https://oddinpay.com"}
+    />
+  {:else if query.isLoading}
+    <Skeleton class="h-8 w-20 bg-gray-300 rounded-md" />
+  {:else if query.data}
+    {#each query.data as site}
+      <Footer privacy={site.slug + "/privacy"} site={site.slug} />
+    {/each}
+  {/if}
+{/if}
+
+<svelte:head>
+  {#if page.url.hostname === "status.oddinpay.com"}
+    <title>Status • Oddinpay</title>
+    <meta
+      name="description"
+      content="Real-time and historical data on Oddinpay system performance."
+    />
+  {:else}
+    {#each query.data as site}
+      <title>{site.title}</title>
+      <meta name="description" content={site.description} />
+    {/each}
+  {/if}
+  <style>
+    .flex-center {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      width: 100%;
+      min-height: 48px;
+    }
+
+    #navToggle {
+      display: none !important;
+    }
+
+    #content h1 {
+      font-size: 2.2em;
+      line-height: 1.5;
+      font-weight: 600;
+    }
+
+    #content h2 {
+      font-size: 1.2em;
+      line-height: 1.5;
+      font-weight: 600;
+    }
+
+    .monitors {
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 1;
+      display: -webkit-box;
+      overflow: hidden;
+    }
+
+    #content p {
+      font-size: 15px;
+      line-height: 1.7;
+    }
+
+    #content h1 {
+      margin-bottom: 24px;
+    }
+
+    /* #content h2 {
+      margin-bottom: 24px;
+      margin-top: 24px;
+    } */
+
+    #content h2 {
+      margin-bottom: 16px;
+      margin-top: 32px;
+    }
+
+    @media (min-width: 768px) {
+      #content h1 {
+        font-size: 2.8em;
+        line-height: 1.5;
+        font-weight: bold;
+      }
+
+      /* #content h2 {
+        font-size: 2em;
+        line-height: 1.5;
+        font-weight: 600;
+      } */
+
+      #content h2 {
+        font-size: 1.4em;
+        line-height: 1.5;
+        font-weight: 600;
+      }
+
+      #content p {
+        font-size: 15px;
+        line-height: 1.7;
+        text-align: balance;
+      }
+    }
+
+    @layer base {
+      #content h1,
+      #content h2,
+      #content h3 {
+        scroll-margin-top: 84px;
+      }
+
+      #content h1,
+      #content h2 {
+        position: relative;
+      }
+    }
+
+    main {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    :root {
+      --wrapper-ui-max-width: 1800px;
+      --wrapper-ui-min-width: 320px;
+      --wrapper-ui-radius: 2rem;
+      --wrapper-ui-bg-color: #f9fafb;
+      --bg: #ffffff;
+      --text: #000000;
+      --up: #4ce04c;
+      --warn: #f2a900;
+      --down: #f05d5e;
+      --inactive: #6b7280;
+      --inactive-service: #6b7280;
+      --active-service: black;
+      --default: #e5e7eb;
+      --chip-radius: 1px;
+      --today-ring: rgba(0, 0, 0, 0.25);
+    }
+
+    .headline8 {
+      text-align: center;
+    }
+
+    .headline-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      width: 100%;
+      gap: 0;
+      text-align: center;
+    }
+
+    .wrapper-ui {
+      display: flex;
+      flex-direction: column;
+      padding: 1rem;
+      width: 100%;
+      border-radius: var(--wrapper-ui-radius);
+      background-color: var(--wrapper-ui-bg-color);
+      max-width: var(--wrapper-ui-max-width);
+      min-width: var(--wrapper-ui-min-width);
+      margin: 0 auto;
+      align-items: center;
+      box-sizing: border-box;
+    }
+
+    .child-wrapper-ui {
+      min-height: 300px;
+      width: 100%;
+      min-width: 200px;
+      max-width: var(--wrapper-ui-max-width);
+      border-radius: var(--wrapper-ui-radius);
+      flex: 1;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 1rem;
+      padding-top: 0;
+    }
+
+    .highlight-indigo-500 {
+      color: #6366f1;
+      font-weight: 600;
+      background: rgba(99, 102, 241, 0.06);
+      padding: 0 4px;
+      border-radius: 4px;
+    }
+
+    .link-underline {
+      text-decoration: underline;
+      color: #4f46e5;
+      font-weight: 600;
+    }
+
+    .title-clamp {
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      word-break: break-word;
+      line-height: 1.4;
+    }
+
+    .legend {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      color: #d9d9d9;
+      padding: 20px;
+    }
+
+    .legend span {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 14px;
+    }
+
+    @media (max-width: 600px) {
+      .legend {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 8px;
+      }
+
+      .legend strong {
+        margin-bottom: 4px;
+      }
+    }
+
+    .status-page {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 50px;
+      max-width: 1200px;
+      margin: 40px auto;
+      padding: 0 20px;
+    }
+
+    .status-card {
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 15px;
+      background: #fff;
+      color: #222;
+      box-shadow:
+        rgba(0, 0, 0, 0.05) 0 6px 24px,
+        rgba(0, 0, 0, 0.08) 0 0 0 1px;
+    }
+
+    .incident-card {
+      background: #f9fafb;
+      color: black;
+      padding: 20px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      box-shadow: rgba(0, 0, 0, 0.05) 0px 0px 0px 1px;
+    }
+
+    .status-entry {
+      margin-top: 20px;
+      margin-bottom: 20px;
+    }
+
+    .time {
+      font-size: 0.9rem;
+      color: var(--inactive);
+      margin-right: 10px;
+    }
+
+    .badge.resolved {
+      background: #d7f7c2;
+      color: #006908;
+      font-weight: 600;
+      border: 1px solid #a6eb84;
+    }
+
+    .badge.investigating {
+      background: #ebeef1;
+      color: #545969;
+      font-weight: 600;
+      border: 1px solid #d5dbe1;
+    }
+
+    .badge.inprogress {
+      background: #fff4e5;
+      color: #b45309;
+      font-weight: 600;
+      border: 1px solid #ffddb3;
+    }
+
+    .badge.completed {
+      background: #d7f7c2;
+      color: #006908;
+      font-weight: 600;
+      border: 1px solid #a6eb84;
+    }
+
+    .badge.identified {
+      background: #ffe3e3;
+      color: #c92a2a;
+      font-weight: 600;
+      border: 1px solid #ffa8a8;
+    }
+
+    .badge.scheduled {
+      background: white;
+      color: #4b5563;
+      font-weight: 600;
+      border: 1px solid #cecece;
+    }
+
+    .badge.cancelled {
+      background: #ffe3e3;
+      color: #c92a2a;
+      font-weight: 600;
+      border: 1px solid #ffa8a8;
+    }
+
+    .badge2.completed {
+      background: #d7f7c2;
+      color: #006908;
+      font-weight: 600;
+      border: 1px solid #a6eb84;
+    }
+
+    .badge2.inprogress {
+      background: #fff4e5;
+      color: #b45309;
+      font-weight: 600;
+      border: 1px solid #ffddb3;
+    }
+
+    .badge2.scheduled {
+      background: white;
+      color: #4b5563;
+      font-weight: 600;
+      border: 1px solid #cecece;
+    }
+
+    .badge {
+      font-size: 0.8rem;
+      padding: 0px 6px;
+      display: inline-block;
+      white-space: nowrap;
+      border-radius: 4px;
+    }
+
+    .badge2 {
+      font-size: 0.8rem;
+      padding: 2px 6px;
+      display: inline-block;
+      white-space: nowrap;
+      border-radius: 4px;
+    }
+
+    .maintenance-list {
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+    }
+
+    .maintenance-card {
+      padding: 15px;
+      border-radius: 6px;
+      color: black;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 5px;
+    }
+
+    .service {
+      font-weight: 600;
+      color: var(--inactive-service);
+    }
+
+    @media (max-width: 750px) {
+      .status-page {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .card {
+      max-width: 950px;
+      margin: 40px auto;
+      padding: 40px;
+      background: var(--bg);
+      border-radius: 10px;
+      color: var(--text);
+      box-shadow:
+        rgba(0, 0, 0, 0.05) 0 6px 24px,
+        rgba(0, 0, 0, 0.08) 0 0 0 1px;
+    }
+
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 12px;
+      font-weight: 600;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .bar {
+      display: flex;
+      gap: 2px;
+      justify-content: space-between;
+    }
+
+    .chip {
+      flex: 1 1 0;
+      display: inline-block;
+      height: 24px;
+      background: var(--default);
+      border-radius: var(--chip-radius);
+    }
+
+    .chip:hover {
+      transform: scaleY(1.15);
+    }
+
+    .chip.up {
+      background: var(--up);
+    }
+    .chip.warn {
+      background: var(--warn);
+    }
+    .chip.down {
+      background: var(--down);
+    }
+    .chip.today {
+      box-shadow: inset 0 0 0 2px var(--today-ring);
+    }
+    .chip {
+      display: none;
+    }
+
+    /* >=901px: last 90 (all) */
+    @media (min-width: 901px) {
+      .chip:nth-last-child(-n + 90) {
+        display: block;
+      }
+      .uptimes .uptime90 {
+        display: inline;
+      }
+      .uptimes .uptime60,
+      .uptimes .uptime30,
+      .uptimes .uptime15 {
+        display: none;
+      }
+      .timeline .label90 {
+        display: inline;
+      }
+      .timeline .label60,
+      .timeline .label30,
+      .timeline .label15 {
+        display: none;
+      }
+    }
+
+    /* 601–900px: last 60 */
+    @media (min-width: 601px) and (max-width: 900px) {
+      .chip:nth-last-child(-n + 60) {
+        display: block;
+      }
+      .uptimes .uptime60 {
+        display: inline;
+      }
+      .uptimes .uptime90,
+      .uptimes .uptime30,
+      .uptimes .uptime15 {
+        display: none;
+      }
+      .timeline .label60 {
+        display: inline;
+      }
+      .timeline .label90,
+      .timeline .label30,
+      .timeline .label15 {
+        display: none;
+      }
+    }
+
+    /* 311–600px: last 30 */
+    @media (min-width: 311px) and (max-width: 600px) {
+      .chip:nth-last-child(-n + 30) {
+        display: block;
+      }
+      .uptimes .uptime30 {
+        display: inline;
+      }
+      .uptimes .uptime90,
+      .uptimes .uptime60,
+      .uptimes .uptime15 {
+        display: none;
+      }
+      .timeline .label30 {
+        display: inline;
+      }
+      .timeline .label90,
+      .timeline .label60,
+      .timeline .label15 {
+        display: none;
+      }
+    }
+
+    /* <=310px: last 15 */
+    @media (max-width: 310px) {
+      .chip:nth-last-child(-n + 15) {
+        display: block;
+      }
+      .uptimes .uptime15 {
+        display: inline;
+      }
+      .uptimes .uptime90,
+      .uptimes .uptime60,
+      .uptimes .uptime30 {
+        display: none;
+      }
+      .timeline .label15 {
+        display: inline;
+      }
+      .timeline .label90,
+      .timeline .label60,
+      .timeline .label30 {
+        display: none;
+      }
+    }
+
+    @media (max-width: 165px) {
+      .bar {
+        width: 90px;
+        height: 20px;
+      }
+    }
+
+    .timeline {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 8px;
+      font-size: 0.85rem;
+      color: #9ea0a3;
+    }
+
+    .profile {
+      aspect-ratio: 1;
+      animation-delay: 1s;
+      border-radius: 99px;
+      margin-inline: auto;
+    }
+
+    .shimmer {
+      background: linear-gradient(90deg, #ededed 30%, #dcdcdc 50%, #ededed 70%);
+      background-size: 400%;
+      animation: shimmer 1.5s infinite linear;
+    }
+
+    @keyframes shimmer {
+      0% {
+        background-position: 100% 100%;
+      }
+      100% {
+        background-position: 0 0;
+      }
+    }
+
+    #container-border {
+      border-width: 2px;
+      border-color: red;
+      border-style: dashed;
+    }
+  </style>
+</svelte:head>

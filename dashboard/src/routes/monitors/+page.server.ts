@@ -1,0 +1,175 @@
+import { zod4 } from "sveltekit-superforms/adapters";
+import { monitorCreate, monitorUpdate } from "$lib/types/form";
+import { fail, type Actions } from "@sveltejs/kit";
+import type { PageServerLoad } from "./$types";
+import { setError, superValidate } from "sveltekit-superforms";
+import { api } from "../../convex/_generated/api";
+import { env } from "$env/dynamic/private";
+import { createConvexAuthHandlers } from "@mmailaender/convex-auth-svelte/sveltekit/server";
+
+export const load: PageServerLoad = async (event) => {
+  const form = await superValidate(event, zod4(monitorCreate));
+  return {
+    form,
+  };
+};
+
+export const actions: Actions = {
+  create: async (e) => {
+    const form = await superValidate(e, zod4(monitorCreate));
+    if (!form.valid) return fail(400, { form });
+
+    try {
+      const { createConvexHttpClient, isAuthenticated } =
+        createConvexAuthHandlers();
+
+      if (!(await isAuthenticated(e))) {
+        return setError(form, "", "Unauthorized: You must be logged in.");
+      }
+
+      const convex = await createConvexHttpClient(e);
+      const apiKey = env.API_KEY;
+
+      if (!apiKey) {
+        return setError(form, "", "API_KEY environment variable is not set");
+      }
+
+      await convex.mutation(api.status.post, {
+        apiKey,
+        host: form.data.host,
+        interval: form.data.interval as number,
+        name: form.data.name,
+        protocol: form.data.protocol,
+      });
+    } catch (error) {
+      return setError(
+        form,
+        error instanceof Error ? error.message : "Failed to create monitor",
+      );
+    }
+
+    return { form };
+  },
+
+  update: async (e) => {
+    const form = await superValidate(e, zod4(monitorUpdate));
+    if (!form.valid) return fail(400, { form });
+
+    try {
+      const { createConvexHttpClient, isAuthenticated } =
+        createConvexAuthHandlers();
+
+      if (!(await isAuthenticated(e))) {
+        return setError(form, "", "Unauthorized: You must be logged in.");
+      }
+
+      const convex = await createConvexHttpClient(e);
+      const apiKey = env.API_KEY;
+
+      if (!apiKey) {
+        return setError(form, "", "API_KEY environment variable is not set");
+      }
+
+      await convex.mutation(api.status.patch, {
+        apiKey,
+        id: form.data._id as any,
+        host: form.data.host,
+        interval: form.data.interval as number,
+        name: form.data.name,
+        protocol: form.data.protocol,
+      });
+    } catch (error) {
+      return setError(
+        form,
+        error instanceof Error ? error.message : "Failed to update monitor",
+      );
+    }
+
+    return { form };
+  },
+
+  delete: async (event) => {
+    const { request } = event;
+    const formData = await request.formData();
+    const id = formData.get("_id");
+    if (!id) {
+      return { status: 400, body: "Missing ID" };
+    }
+
+    try {
+      const { createConvexHttpClient, isAuthenticated } =
+        createConvexAuthHandlers();
+
+      if (!(await isAuthenticated(event))) {
+        return setError(
+          formData as any,
+          "",
+          "Unauthorized: You must be logged in.",
+        );
+      }
+
+      const convex = await createConvexHttpClient(event);
+      const apiKey = env.API_KEY;
+
+      if (!apiKey) {
+        return setError(
+          formData as any,
+          "",
+          "API_KEY environment variable is not set",
+        );
+      }
+
+      await convex.mutation(api.status.deleteById, {
+        apiKey,
+        id: formData.get("_id") as any,
+      });
+
+      return { success: true };
+    } catch (err) {
+      console.error(err);
+      return { status: 500, body: "Failed to delete" };
+    }
+  },
+
+  deleteBulk: async (event) => {
+    const { request } = event;
+    const formData = await request.formData();
+    const rawIdData = formData.get("_id");
+
+    if (!rawIdData) {
+      return { status: 400, body: "Missing IDs" };
+    }
+
+    try {
+      const { createConvexHttpClient, isAuthenticated } =
+        createConvexAuthHandlers();
+
+      if (!(await isAuthenticated(event))) {
+        return setError(
+          formData as any,
+          "",
+          "Unauthorized: You must be logged in.",
+        );
+      }
+
+      const convex = await createConvexHttpClient(event);
+      const apiKey = env.API_KEY;
+
+      if (!apiKey) {
+        return { status: 500, body: "API_KEY not set" };
+      }
+
+      const ids = JSON.parse(rawIdData as string);
+
+      await convex.mutation(api.status.deleteBulk, {
+        apiKey,
+        id: ids,
+      });
+
+      return { success: true };
+    } catch (err) {
+      console.error("Bulk delete failed:", err);
+      return { status: 500, body: "Failed to delete" };
+    }
+  },
+};

@@ -1,0 +1,91 @@
+import { Hono } from "hono";
+import { ConvexHttpClient } from "convex/browser";
+import { api } from "../convex/_generated/api";
+import { Resend } from "resend";
+
+type Bindings = {
+  PUBLIC_CONVEX_CLOUD_URL: string;
+  API_KEY: string;
+  RESEND_API_KEY: string;
+};
+
+export interface EmailTask {
+  from: string;
+  email: string;
+  subject: string;
+  template: string;
+}
+
+function calculateBackoff(attempts: number, baseDelay: number): number {
+  const delay = Math.pow(2, attempts - 1) * baseDelay;
+  const maxDelay = 43200; // 12 hours in seconds
+  return Math.min(delay, maxDelay);
+}
+
+let convex: ConvexHttpClient;
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+const getConvex = (env: Bindings) => {
+  if (!convex) {
+    convex = new ConvexHttpClient(env.PUBLIC_CONVEX_CLOUD_URL);
+  }
+  return convex;
+};
+
+export default {
+  async queue(batch: MessageBatch<EmailTask>, env: Bindings): Promise<void> {
+    const client = getConvex(env);
+    const resend = new Resend(env.RESEND_API_KEY);
+
+    for (const message of batch.messages) {
+      try {
+        const { email, from, subject, template } = message.body;
+        console.log(`[Queue] Processing: ${message.id} to ${email}`);
+
+        try {
+          await client.mutation(api.subscribers.addSubscriber, {
+            apiKey: env.API_KEY,
+            email,
+            status: "subscribed",
+          });
+          console.log(`[Queue] Convex subscriber added successfully: ${email}`);
+        } catch (convexError) {
+          console.log(`[Queue] Convex subscriber already exists: ${email}`);
+          message.ack();
+          continue;
+        }
+
+        const { error } = await resend.emails.send({
+          from: from,
+          to: email,
+          subject: subject,
+          html: template,
+        });
+
+        if (error) {
+          throw new Error(`Resend API Error: ${error.message}`);
+        }
+
+        console.log(`[Queue] Email sent successfully to ${email}`);
+        message.ack();
+      } catch (err) {
+        const error = err as Error;
+        console.error(`[Queue] Failed message ${message.id}: ${error.message}`);
+
+        if (message.attempts < 20) {
+          const delay = calculateBackoff(message.attempts, 30);
+          console.log(`[Queue] Retrying ${message.id} in ${delay} seconds...`);
+          message.retry({ delaySeconds: delay });
+        } else {
+          console.error(
+            `[Queue] Max retries reached for ${message.id}. Routing to DLQ.`,
+          );
+          message.retry();
+        }
+      }
+    }
+  },
+
+  fetch: app.fetch,
+};
